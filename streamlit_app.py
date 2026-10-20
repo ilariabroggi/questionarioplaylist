@@ -1,17 +1,18 @@
-import streamlit as st
-import numpy as np
-import pandas as pd
-import librosa
-import joblib
-import json
 import base64
-import requests
-
+import json
+import re
+from datetime import datetime
 from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.parse import quote_plus
-from datetime import datetime
 from zoneinfo import ZoneInfo
+
+import joblib
+import librosa
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 
 
 # ============================================================
@@ -21,62 +22,108 @@ from zoneinfo import ZoneInfo
 st.set_page_config(
     page_title="Playlist ed emozioni",
     page_icon="🎵",
-    layout="centered"
+    layout="centered",
 )
 
+BASE_DIR = Path(__file__).resolve().parent
+
+# Le etichette interne restano in inglese, perché devono coincidere
+# con i nomi dei centroidi SER e con i nomi dei file musicali.
+EMOTIONS = [
+    "angry",
+    "calm",
+    "disgust",
+    "fearful",
+    "happy",
+    "neutral",
+    "sad",
+    "surprised",
+]
+
+EMOTION_ITALIAN = {
+    "happy": "Felice",
+    "surprised": "Sorpreso",
+    "calm": "Calmo",
+    "neutral": "Neutro",
+    "angry": "Arrabbiato",
+    "fearful": "Impaurito",
+    "disgust": "Disgustato",
+    "sad": "Triste",
+}
+
+DECLARED_EMOTION_MAPPING = {
+    "Neutro": "neutral",
+    "Calmo": "calm",
+    "Felice": "happy",
+    "Triste": "sad",
+    "Arrabbiato": "angry",
+    "Impaurito": "fearful",
+    "Disgustato": "disgust",
+    "Sorpreso": "surprised",
+}
+
+# Per queste emozioni proponiamo la scelta tra playlist coerente e benessere.
+EMOTIONS_WITH_MODE_QUESTION = {"angry", "fearful", "sad", "disgust"}
+
+# Destinazioni definite per la modalità benessere.
+WELLBEING_DESTINATIONS = {
+    "angry": "calm",
+    "fearful": "calm",
+    "disgust": "calm",
+    "sad": "happy",
+}
+
+# Centroidi valenza-arousal RAVDESS comunicati dal professore.
+# Ogni coppia è (valence, arousal), nella scala 1-9.
+VA_CENTERS = {
+    "happy": (8.47, 6.05),
+    "calm": (6.89, 1.67),
+    "sad": (2.10, 3.49),
+    "angry": (2.53, 6.20),
+    "fearful": (2.66, 5.45),
+    "disgust": (3.32, 5.00),
+    "surprised": (6.57, 5.95),
+    "neutral": (5.50, 3.45),
+}
+
 
 # ============================================================
-# INIZIALIZZAZIONE SESSION STATE
+# INIZIALIZZAZIONE DELLO STATO DELLA SESSIONE
 # ============================================================
 
-if "analisi_completata" not in st.session_state:
-    st.session_state.analisi_completata = False
+SESSION_DEFAULTS = {
+    "analisi_completata": False,
+    "playlist_generata": False,
+    "final_emotion": None,
+    "playlist_df": None,
+    "playlist_fallback_used": False,
+    "playlist_mode": None,
+    "playlist_destination": None,
+    "questionario_aperto": False,
+    "risultato_salvato": False,
+    "preferenze_iniziali": None,
+    "emozione_dichiarata_iniziale": None,
+}
 
-if "playlist_generata" not in st.session_state:
-    st.session_state.playlist_generata = False
-
-if "final_emotion" not in st.session_state:
-    st.session_state.final_emotion = None
-
-if "music_mood" not in st.session_state:
-    st.session_state.music_mood = None
-
-if "playlist_df" not in st.session_state:
-    st.session_state.playlist_df = None
-
-if "playlist_fallback_used" not in st.session_state:
-    st.session_state.playlist_fallback_used = False
-
-if "questionario_aperto" not in st.session_state:
-    st.session_state.questionario_aperto = False
-
-if "risultato_salvato" not in st.session_state:
-    st.session_state.risultato_salvato = False
+for state_key, default_value in SESSION_DEFAULTS.items():
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default_value
 
 
 # ============================================================
 # COLLEGAMENTO A GITHUB PER I RISULTATI DEL QUESTIONARIO
 # ============================================================
 
-GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
-
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_OWNER = "ilariabroggi"
 GITHUB_REPO = "questionarioplaylist"
 GITHUB_BRANCH = "main"
-
 GITHUB_RESULTS_FILE = "risultati_questionario.csv"
 
 GITHUB_API_URL = (
-    f"https://api.github.com/repos/"
-    f"{GITHUB_OWNER}/"
-    f"{GITHUB_REPO}/contents/"
-    f"{GITHUB_RESULTS_FILE}"
+    f"https://api.github.com/repos/{GITHUB_OWNER}/"
+    f"{GITHUB_REPO}/contents/{GITHUB_RESULTS_FILE}"
 )
-
-
-# ============================================================
-# COLONNE DEL FILE DEI RISULTATI
-# ============================================================
 
 RESULTS_COLUMNS = [
     "id_partecipante",
@@ -89,6 +136,8 @@ RESULTS_COLUMNS = [
     "emozione_dichiarata",
     "emozione_stimata",
     "mood",
+    "modalita_playlist",
+    "emozione_destinazione",
     "numero_canzoni",
     "song_id_1",
     "song_id_2",
@@ -107,343 +156,147 @@ RESULTS_COLUMNS = [
     "genere",
     "eta",
     "regione_residenza",
-    "istruzione"
+    "istruzione",
 ]
 
 
-# ============================================================
-# LETTURA DEL FILE RISULTATI DA GITHUB
-# ============================================================
-
 def load_results_from_github():
+    """Legge il CSV dei risultati e restituisce anche il suo SHA GitHub."""
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "Il segreto GITHUB_TOKEN non è configurato in Streamlit."
+        )
 
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2026-03-10"
+        "X-GitHub-Api-Version": "2026-03-10",
     }
 
     response = requests.get(
         GITHUB_API_URL,
         headers=headers,
-        params={
-            "ref": GITHUB_BRANCH
-        },
-        timeout=30
+        params={"ref": GITHUB_BRANCH},
+        timeout=30,
     )
 
     if response.status_code != 200:
-
         raise RuntimeError(
-            "Errore durante la lettura del file "
-            "risultati_questionario.csv da GitHub.\n\n"
-            f"Codice HTTP: {response.status_code}\n"
-            f"Risposta GitHub: {response.text}"
+            "Errore durante la lettura di risultati_questionario.csv da GitHub. "
+            f"Codice HTTP: {response.status_code}. Risposta: {response.text}"
         )
 
     data = response.json()
+    decoded_content = base64.b64decode(data["content"]).decode("utf-8")
+    results_df = pd.read_csv(StringIO(decoded_content))
+    return results_df, data["sha"]
 
-    file_sha = data["sha"]
-
-    encoded_content = data["content"]
-
-    decoded_content = base64.b64decode(
-        encoded_content
-    ).decode(
-        "utf-8"
-    )
-
-    results_df = pd.read_csv(
-        StringIO(decoded_content)
-    )
-
-    return results_df, file_sha
-
-
-# ============================================================
-# GENERAZIONE ID PARTECIPANTE
-# ============================================================
 
 def generate_participant_id(results_df):
-
-    if results_df.empty:
+    if results_df.empty or "id_partecipante" not in results_df.columns:
         return "0001"
 
-    if "id_partecipante" not in results_df.columns:
-        return "0001"
-
-    existing_ids = (
-        results_df["id_partecipante"]
-        .astype(str)
-        .str.extract(r"(\d+)", expand=False)
+    existing_ids = results_df["id_partecipante"].astype(str).str.extract(
+        r"(\d+)", expand=False
     )
-
-    numeric_ids = pd.to_numeric(
-        existing_ids,
-        errors="coerce"
-    )
-
-    numeric_ids = numeric_ids.dropna()
-
-    if numeric_ids.empty:
-        next_id = 1
-    else:
-        next_id = int(
-            numeric_ids.max()
-        ) + 1
-
+    numeric_ids = pd.to_numeric(existing_ids, errors="coerce").dropna()
+    next_id = 1 if numeric_ids.empty else int(numeric_ids.max()) + 1
     return f"{next_id:04d}"
 
 
-# ============================================================
-# SALVATAGGIO DI UN NUOVO RISULTATO SU GITHUB
-# ============================================================
-
 def save_result_to_github(new_row):
-
-    # ========================================================
-    # PRIMO TENTATIVO
-    # ========================================================
-
+    """Aggiunge una riga al CSV su GitHub, ritentando in caso di conflitto."""
     for attempt in range(3):
-
         results_df, file_sha = load_results_from_github()
-
-        # ----------------------------------------------------
-        # CREIAMO UN DATAFRAME CON LA NUOVA RISPOSTA
-        # ----------------------------------------------------
-
-        new_row_df = pd.DataFrame(
-            [new_row]
-        )
-
-        # ----------------------------------------------------
-        # CI ASSICURIAMO CHE TUTTE LE COLONNE
-        # SIANO PRESENTI
-        # ----------------------------------------------------
+        new_row_df = pd.DataFrame([new_row])
 
         for column in RESULTS_COLUMNS:
-
             if column not in new_row_df.columns:
-
                 new_row_df[column] = pd.NA
 
-        # ----------------------------------------------------
-        # MANTENIAMO ESATTAMENTE L'ORDINE
-        # DELLE COLONNE
-        # ----------------------------------------------------
-
-        new_row_df = new_row_df[
-            RESULTS_COLUMNS
-        ]
-
-        # ----------------------------------------------------
-        # AGGIUNGIAMO LA NUOVA RIGA
-        # ----------------------------------------------------
-
-        updated_df = pd.concat(
-            [
-                results_df,
-                new_row_df
-            ],
-            ignore_index=True
-        )
-
-        # ----------------------------------------------------
-        # CONVERSIONE DEL DATAFRAME IN CSV
-        # ----------------------------------------------------
-
-        csv_content = updated_df.to_csv(
-            index=False
-        )
-
-        # ----------------------------------------------------
-        # CODIFICA BASE64
-        # ----------------------------------------------------
-
+        new_row_df = new_row_df[RESULTS_COLUMNS]
+        updated_df = pd.concat([results_df, new_row_df], ignore_index=True)
+        csv_content = updated_df.to_csv(index=False)
         encoded_content = base64.b64encode(
             csv_content.encode("utf-8")
         ).decode("utf-8")
 
-        # ----------------------------------------------------
-        # HEADER DELLA RICHIESTA
-        # ----------------------------------------------------
-
         headers = {
             "Authorization": f"Bearer {GITHUB_TOKEN}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10"
+            "X-GitHub-Api-Version": "2026-03-10",
         }
-
-        # ----------------------------------------------------
-        # DATI DA INVIARE A GITHUB
-        # ----------------------------------------------------
-
         payload = {
-            "message": (
-                f"Salvataggio questionario "
-                f"{new_row['id_partecipante']}"
-            ),
+            "message": f"Salvataggio questionario {new_row['id_partecipante']}",
             "content": encoded_content,
             "sha": file_sha,
-            "branch": GITHUB_BRANCH
+            "branch": GITHUB_BRANCH,
         }
-
-        # ----------------------------------------------------
-        # AGGIORNAMENTO DEL FILE
-        # ----------------------------------------------------
 
         response = requests.put(
             GITHUB_API_URL,
             headers=headers,
             json=payload,
-            timeout=30
+            timeout=30,
         )
 
-        # ----------------------------------------------------
-        # SALVATAGGIO RIUSCITO
-        # ----------------------------------------------------
-
-        if response.status_code in [200, 201]:
-
+        if response.status_code in (200, 201):
             return True
-
-        # ----------------------------------------------------
-        # CONFLITTO DI VERSIONE
-        #
-        # Rileggiamo il file e riproviamo.
-        # ----------------------------------------------------
-
+        if response.status_code == 409 and attempt < 2:
+            continue
         if response.status_code == 409:
-
-            if attempt < 2:
-                continue
-
-            raise RuntimeError(
-                "CONFLICT_GITHUB"
-            )
-
-        # ----------------------------------------------------
-        # ALTRI ERRORI
-        # ----------------------------------------------------
+            raise RuntimeError("CONFLICT_GITHUB")
 
         raise RuntimeError(
-            "Errore durante il salvataggio del risultato "
-            "su GitHub.\n\n"
-            f"Codice HTTP: {response.status_code}\n"
-            f"Risposta GitHub: {response.text}"
+            "Errore durante il salvataggio del risultato su GitHub. "
+            f"Codice HTTP: {response.status_code}. Risposta: {response.text}"
         )
 
     return False
 
 
 # ============================================================
-# CARICAMENTO DEI FILE NECESSARI
+# CARICAMENTO DEL MODELLO SER VOCALE
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-
-centroids = pd.read_csv(
-    BASE_DIR / "centroidi_emozioni.csv",
-    index_col=0
-)
-
-scaler = joblib.load(
-    BASE_DIR / "scaler_mfcc.pkl"
-)
-
-with open(
-    BASE_DIR / "feature_cols.json",
-    "r"
-) as file:
-    feature_cols = json.load(file)
-
-
-# ============================================================
-# NORMALIZZAZIONE DEI NOMI DELLE EMOZIONI
-# ============================================================
-
-centroids.index = [
-    str(emotion).strip().lower()
-    for emotion in centroids.index
-]
-
-
-# ============================================================
-# EMOZIONI AMMESSE PER IL RISULTATO FINALE
-# ============================================================
-
-final_emotions = [
-    "calm",
-    "happy",
-    "sad",
-    "angry"
-]
-
-
-missing_final_emotions = [
-    emotion
-    for emotion in final_emotions
-    if emotion not in centroids.index
-]
-
-if missing_final_emotions:
-
+try:
+    centroids = pd.read_csv(BASE_DIR / "centroidi_emozioni.csv", index_col=0)
+    scaler = joblib.load(BASE_DIR / "scaler_mfcc.pkl")
+    with open(BASE_DIR / "feature_cols.json", "r", encoding="utf-8") as file:
+        feature_cols = json.load(file)
+except Exception as exc:
     st.error(
-        "Nel file centroidi_emozioni.csv non sono state trovate "
-        f"queste emozioni necessarie per il risultato finale: "
-        f"{', '.join(missing_final_emotions)}"
+        "Non è stato possibile caricare i file del modello vocale. "
+        "Controlla che centroidi_emozioni.csv, scaler_mfcc.pkl e "
+        f"feature_cols.json siano presenti nel repository. Dettaglio: {exc}"
     )
-
     st.stop()
 
+centroids.index = [str(emotion).strip().lower() for emotion in centroids.index]
+centroids = centroids[~centroids.index.duplicated(keep="first")]
 
-# ============================================================
-# CONTROLLO DELLE FEATURE MFCC
-# ============================================================
+missing_ser_emotions = [emotion for emotion in EMOTIONS if emotion not in centroids.index]
+if missing_ser_emotions:
+    st.error(
+        "Il file centroidi_emozioni.csv non contiene tutti gli otto centroidi "
+        "emotivi necessari per questa versione dell'app: "
+        f"{', '.join(missing_ser_emotions)}. "
+        "Non è possibile distinguere tutte le otto emozioni se i centroidi "
+        "del modello vocale non sono disponibili."
+    )
+    st.stop()
 
-missing_features = [
-    feature
-    for feature in feature_cols
-    if feature not in centroids.columns
-]
-
-if missing_features:
-
+missing_centroid_features = [feature for feature in feature_cols if feature not in centroids.columns]
+if missing_centroid_features:
     st.error(
         "Nel file centroidi_emozioni.csv mancano alcune feature MFCC: "
-        f"{', '.join(missing_features)}"
+        f"{', '.join(missing_centroid_features)}"
     )
-
     st.stop()
 
 
 # ============================================================
-# MAPPATURA EMOZIONE VOCALE → MOOD MUSICALE
-# ============================================================
-
-emotion_to_music_mood = {
-    "calm": "calm",
-    "happy": "happy",
-    "sad": "sad",
-    "angry": "energetic"
-}
-
-
-# ============================================================
-# FILE DEI DATASET MUSICALI
-# ============================================================
-
-music_dataset_files = {
-    "calm": "songs_clean_calm.csv",
-    "happy": "songs_clean_happy.csv",
-    "sad": "songs_clean_sad.csv",
-    "energetic": "songs_clean_energetic.csv.gz"
-}
-
-
-# ============================================================
-# CONVERSIONE DEI VALORI DEL QUESTIONARIO
+# CONVERSIONE DELLE RISPOSTE DEL QUESTIONARIO
 # ============================================================
 
 genre_mapping = {
@@ -456,9 +309,8 @@ genre_mapping = {
     "Rhythm and Blues": "R&B",
     "Jazz": "Jazz",
     "Blues": "Blues",
-    "Colonne sonore e musica classica": "Classical"
+    "Colonne sonore e musica classica": "Classical",
 }
-
 
 language_mapping = {
     "Italiano": "italian",
@@ -466,745 +318,541 @@ language_mapping = {
     "Spagnolo": "spanish",
     "Portoghese": "portuguese",
     "Francese": "french",
-    "Tedesco": "german"
+    "Tedesco": "german",
 }
+
+POPULARITY_POPULAR = "Canzoni popolari"
+POPULARITY_NICHE = "Canzoni poco conosciute"
 
 
 # ============================================================
-# FUNZIONE PER ESTRARRE LE FEATURE MFCC
+# ESTRAZIONE DELLE FEATURE MFCC E PREVISIONE SER
 # ============================================================
 
 def extract_mfcc_features(audio_file):
-
     audio_bytes = audio_file.getvalue()
+    signal, sample_rate = librosa.load(BytesIO(audio_bytes), sr=48000)
 
-    signal, sample_rate = librosa.load(
-        BytesIO(audio_bytes),
-        sr=48000
-    )
+    mfcc = librosa.feature.mfcc(y=signal, sr=sample_rate, n_mfcc=13)
+    mfcc_mean = np.mean(mfcc, axis=1)
+    mfcc_std = np.std(mfcc, axis=1)
+    feature_vector = np.concatenate([mfcc_mean, mfcc_std])
 
-    mfcc = librosa.feature.mfcc(
-        y=signal,
-        sr=sample_rate,
-        n_mfcc=13
-    )
+    if len(feature_vector) != len(feature_cols):
+        raise ValueError(
+            "Il numero di feature MFCC estratte non coincide con quello "
+            "atteso dal modello. Controlla feature_cols.json."
+        )
 
-    mfcc_mean = np.mean(
-        mfcc,
-        axis=1
-    )
-
-    mfcc_std = np.std(
-        mfcc,
-        axis=1
-    )
-
-    feature_vector = np.concatenate(
-        [
-            mfcc_mean,
-            mfcc_std
-        ]
-    )
-
-    features_df = pd.DataFrame(
-        [feature_vector],
-        columns=feature_cols
-    )
-
-    return features_df
+    return pd.DataFrame([feature_vector], columns=feature_cols)
 
 
-# ============================================================
-# FUNZIONE PER CALCOLARE LE DISTANZE DAI CENTROIDI
-# ============================================================
+def predict_emotion_from_two_recordings(audio_1, audio_2):
+    """Classifica il punto medio delle due registrazioni rispetto agli 8 centroidi."""
+    features_1 = extract_mfcc_features(audio_1)
+    features_2 = extract_mfcc_features(audio_2)
 
-def calculate_distances(features_df):
-
-    features_std = scaler.transform(
-        features_df[feature_cols]
-    )
-
-    features_std_df = pd.DataFrame(
-        features_std,
-        columns=feature_cols
-    )
-
-    point = features_std_df.iloc[0].values
+    standardized_1 = scaler.transform(features_1[feature_cols])
+    standardized_2 = scaler.transform(features_2[feature_cols])
+    mean_point = (standardized_1[0] + standardized_2[0]) / 2
 
     distances = {}
-
-    for emotion in centroids.index:
-
-        centroid = centroids.loc[
-            emotion,
-            feature_cols
-        ].values.astype(float)
-
-        distance = np.linalg.norm(
-            point - centroid
-        )
-
-        distances[emotion] = distance
-
-    return features_std_df, distances
-
-
-# ============================================================
-# FUNZIONE PER CLASSIFICARE L'EMOZIONE
-# ============================================================
-
-def predict_emotion(features_df):
-
-    features_std_df, distances = calculate_distances(
-        features_df
-    )
+    for emotion in EMOTIONS:
+        centroid = centroids.loc[emotion, feature_cols].to_numpy(dtype=float)
+        distances[emotion] = float(np.linalg.norm(mean_point - centroid))
 
     if not distances:
+        raise ValueError("Non è stato possibile calcolare le distanze dai centroidi vocali.")
 
-        raise ValueError(
-            "Non è stato possibile calcolare le distanze "
-            "dai centroidi."
-        )
-
-    predicted_emotion = min(
-        distances,
-        key=distances.get
-    )
-
-    return (
-        predicted_emotion,
-        distances,
-        features_std_df
-    )
+    return min(distances, key=distances.get), distances
 
 
 # ============================================================
-# CARICAMENTO DEL DATASET MUSICALE
+# CARICAMENTO DEGLI OTTO DATASET MUSICALI
 # ============================================================
 
-@st.cache_data
-def load_music_dataset(music_mood):
+REQUIRED_MUSIC_COLUMNS = [
+    "id",
+    "name",
+    "album_name",
+    "artists",
+    "year",
+    "genre",
+    "popularity",
+    "language",
+    "valence_va",
+    "arousal_va",
+    "emotion_va",
+    "emotion_va_distance",
+]
+OPTIONAL_MUSIC_COLUMNS = []  # Le colonne non usate dalla playlist non vengono caricate, per contenere la memoria.
 
-    if music_mood not in music_dataset_files:
 
-        raise ValueError(
-            f"Mood musicale non riconosciuto: {music_mood}"
-        )
+def normalize_column_name(value):
+    value = str(value).strip().lower()
+    return re.sub(r"[^a-z0-9]+", "_", value).strip("_")
 
-    file_name = music_dataset_files[music_mood]
 
+MUSIC_DATASET_FILES = {
+    "happy": "songs_clean_happy.csv",
+    "surprised": "songs_clean_surprised.csv",
+    "neutral": "songs_clean_neutral.csv",
+    "calm": "songs_clean_calm.csv",
+    "angry": "songs_clean_angry.csv",
+    "fearful": "songs_clean_fearful.csv",
+    "disgust": "songs_clean_disgust.csv",
+    "sad": "songs_clean_sad.csv",
+}
+
+
+def find_emotion_dataset_file(emotion):
+    """Restituisce il percorso del CSV previsto per una specifica emotion_va."""
+    emotion = str(emotion).strip().lower()
+
+    if emotion not in MUSIC_DATASET_FILES:
+        raise ValueError(f"Emozione musicale non riconosciuta: {emotion}")
+
+    file_name = MUSIC_DATASET_FILES[emotion]
     file_path = BASE_DIR / file_name
 
-    if not file_path.exists():
-
+    if not file_path.is_file():
         raise FileNotFoundError(
-            f"Non è stato trovato il dataset musicale: {file_name}"
+            f"Non è stato trovato il dataset dell'emozione '{emotion}'. "
+            f"Il file atteso è '{file_name}' nella cartella {BASE_DIR}. "
+            "Controlla che il nome sia esattamente questo e che il file sia nel repository."
         )
 
-    required_columns = [
-        "id",
-        "name",
-        "album_name",
-        "artists",
-        "year",
-        "genre",
-        "mood",
-        "language",
-        "mood_distance",
-        "popularity"
-    ]
+    return file_path
 
-    header = pd.read_csv(
-        file_path,
-        nrows=0
-    )
+@st.cache_data(show_spinner=False)
+def load_music_dataset(emotion):
+    """Carica un dataset musicale singolo in base a emotion_va."""
+    emotion = str(emotion).strip().lower()
+    if emotion not in EMOTIONS:
+        raise ValueError(f"Emozione musicale non riconosciuta: {emotion}")
 
-    actual_columns = list(
-        header.columns
-    )
-
-    column_map = {
-        str(column).strip().lower(): column
-        for column in actual_columns
-    }
+    file_path = find_emotion_dataset_file(emotion)
+    header = pd.read_csv(file_path, nrows=0)
+    column_map = {normalize_column_name(column): column for column in header.columns}
 
     missing_columns = [
-        column
-        for column in required_columns
+        column for column in REQUIRED_MUSIC_COLUMNS
         if column not in column_map
     ]
-
     if missing_columns:
-
         raise ValueError(
-            "Nel dataset "
-            f"{file_name} "
-            "mancano le seguenti colonne necessarie: "
-            +
-            ", ".join(missing_columns)
-            +
-            ".\n\n"
-            "Colonne effettivamente presenti nel file: "
-            +
-            ", ".join(
-                str(column)
-                for column in actual_columns
-            )
+            f"Nel dataset {file_path.name} mancano le colonne: {', '.join(missing_columns)}. "
+            f"Colonne trovate: {', '.join(map(str, header.columns))}"
         )
 
-    actual_required_columns = [
-        column_map[column]
-        for column in required_columns
+    requested_columns = [column_map[column] for column in REQUIRED_MUSIC_COLUMNS]
+    requested_columns += [
+        column_map[column] for column in OPTIONAL_MUSIC_COLUMNS if column in column_map
     ]
-
     df = pd.read_csv(
         file_path,
-        usecols=actual_required_columns
+        usecols=list(dict.fromkeys(requested_columns)),
+        low_memory=False,
     )
+    df.columns = [normalize_column_name(column) for column in df.columns]
 
-    rename_map = {
-        actual_column: normalized_column
-        for normalized_column, actual_column
-        in zip(
-            required_columns,
-            actual_required_columns
-        )
-    }
+    df["id"] = df["id"].astype("string").str.strip()
+    df["emotion_va"] = df["emotion_va"].astype("string").str.strip().str.lower()
+    df["language"] = df["language"].astype("string").str.strip().str.lower()
+    df["genre"] = df["genre"].astype("string").str.strip()
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce")
+    df["valence_va"] = pd.to_numeric(df["valence_va"], errors="coerce")
+    df["arousal_va"] = pd.to_numeric(df["arousal_va"], errors="coerce")
+    df["emotion_va_distance"] = pd.to_numeric(df["emotion_va_distance"], errors="coerce")
 
-    df = df.rename(
-        columns=rename_map
-    )
+    df = df.dropna(
+        subset=[
+            "id", "name", "album_name", "artists", "year", "genre",
+            "popularity", "language", "valence_va", "arousal_va",
+            "emotion_va", "emotion_va_distance",
+        ]
+    ).copy()
+    df = df[df["id"].ne("")].copy()
 
-    df["year"] = pd.to_numeric(
-        df["year"],
-        errors="coerce"
-    )
+    # Il file di partizione dovrebbe contenere soltanto l'emozione richiesta;
+    # il filtro rende il comportamento sicuro anche se un file è stato creato male.
+    df = df[df["emotion_va"].eq(emotion)].copy()
 
-    df["mood_distance"] = pd.to_numeric(
-        df["mood_distance"],
-        errors="coerce"
-    )
+    return df.reset_index(drop=True)
 
-    df["popularity"] = pd.to_numeric(
-        df["popularity"],
-        errors="coerce"
-    )
 
-    df["language"] = (
-        df["language"]
-        .astype("string")
-        .str.strip()
-        .str.lower()
-    )
-
-    df["genre"] = (
-        df["genre"]
-        .astype("string")
-        .str.strip()
-    )
-
-    df = df[
-        df["year"].notna()
-        &
-        df["mood_distance"].notna()
-        &
-        df["popularity"].notna()
-    ].copy()
-
-    return df
+@st.cache_data(show_spinner=False)
+def load_all_music_datasets():
+    """Unisce gli otto dataset per poter cercare brani sui punti intermedi."""
+    frames = [load_music_dataset(emotion) for emotion in EMOTIONS]
+    all_songs = pd.concat(frames, ignore_index=True)
+    all_songs = all_songs.drop_duplicates(subset="id", keep="first")
+    return all_songs.reset_index(drop=True)
 
 
 # ============================================================
-# ORDINAMENTO DI UN BLOCCO DI CANDIDATE
+# FILTRI E ORDINAMENTO PER LA PLAYLIST COERENTE
 # ============================================================
 
-def rank_block(
-    df,
-    popularity_preference
-):
+def filter_by_preferences(df, preferences, tier):
+    """Applica i filtri; il genere resta sempre obbligatorio.
 
+    tier 0: genere + periodo + lingua
+    tier 1: genere + periodo
+    tier 2: solo genere
+    """
+    music_genre = genre_mapping[preferences["genre"]]
+    filtered = df[df["genre"].eq(music_genre)].copy()
+
+    if tier <= 1:
+        filtered = filtered[
+            filtered["year"].ge(preferences["start_year"])
+            & filtered["year"].le(preferences["end_year"])
+        ].copy()
+
+    if tier == 0:
+        music_language = language_mapping[preferences["language"]]
+        filtered = filtered[filtered["language"].eq(music_language)].copy()
+
+    return filtered
+
+
+def rank_coherent_block(df, popularity_preference):
     if df.empty:
-
         return df.copy()
+    if popularity_preference == POPULARITY_POPULAR:
+        return df.sort_values("popularity", ascending=False, kind="stable").copy()
+    return df.sort_values("emotion_va_distance", ascending=True, kind="stable").copy()
 
-    if popularity_preference == "Canzoni popolari":
 
-        return (
-            df
-            .sort_values(
-                by="popularity",
-                ascending=False
-            )
-            .copy()
-        )
+def generate_coherent_playlist(emotion, preferences, target_songs=7):
+    """Playlist coerente: tutti i brani devono avere l'emozione stimata."""
+    emotion_df = load_music_dataset(emotion)
+    last_candidate_set = emotion_df.iloc[0:0].copy()
 
+    for tier in (0, 1, 2):
+        candidates = filter_by_preferences(emotion_df, preferences, tier)
+        last_candidate_set = candidates
+        ranked = rank_coherent_block(candidates, preferences["popularity_preference"])
+
+        if len(ranked) >= target_songs:
+            return ranked.head(target_songs).reset_index(drop=True), tier > 0
+
+    ranked = rank_coherent_block(last_candidate_set, preferences["popularity_preference"])
+    return ranked.head(target_songs).reset_index(drop=True), True
+
+
+# ============================================================
+# GEOMETRIA DEL PERCORSO VALENZA-AROUSAL
+# ============================================================
+
+def coordinates_for_emotion(emotion):
+    if emotion not in VA_CENTERS:
+        raise ValueError(f"Non è disponibile il centro valenza-arousal per '{emotion}'.")
+    return np.asarray(VA_CENTERS[emotion], dtype=float)
+
+
+def intermediate_points(start_emotion, destination_emotion):
+    """Restituisce i tre punti al 25%, 50% e 75% della traiettoria."""
+    start = coordinates_for_emotion(start_emotion)
+    destination = coordinates_for_emotion(destination_emotion)
+    return [start + t * (destination - start) for t in (0.25, 0.50, 0.75)]
+
+
+def select_endpoint_songs(candidates, emotion, count, popularity_preference, excluded_ids):
+    pool = candidates[candidates["emotion_va"].eq(emotion)].copy()
+    pool = pool[~pool["id"].astype(str).isin(excluded_ids)].copy()
+
+    if popularity_preference == POPULARITY_POPULAR:
+        pool = pool.sort_values("popularity", ascending=False, kind="stable")
     else:
+        pool = pool.sort_values("emotion_va_distance", ascending=True, kind="stable")
 
-        return (
-            df
-            .sort_values(
-                by="mood_distance",
-                ascending=True
-            )
-            .copy()
+    selected = pool.head(count).copy()
+    return selected.reset_index(drop=True)
+
+
+def select_middle_songs(candidates, start_emotion, destination_emotion,
+                        popularity_preference, excluded_ids, allow_partial=False):
+    """Seleziona tre brani intermedi e li ordina dall'inizio alla fine.
+
+    Popolari: fra i brani la cui proiezione cade dentro il segmento, prende i
+    tre più popolari e poi li ordina lungo la traiettoria.
+
+    Poco conosciute/rappresentative: sceglie il brano più vicino a ciascuno dei
+    tre punti intermedi (25%, 50%, 75%), senza riutilizzare ID.
+    """
+    start = coordinates_for_emotion(start_emotion)
+    destination = coordinates_for_emotion(destination_emotion)
+    direction = destination - start
+    length_squared = float(np.dot(direction, direction))
+
+    pool = candidates[~candidates["id"].astype(str).isin(excluded_ids)].copy()
+    if pool.empty:
+        return pool
+
+    xy = pool[["valence_va", "arousal_va"]].to_numpy(dtype=float)
+    projection_t = ((xy - start) @ direction) / length_squared
+    pool = pool.assign(_trajectory_t=projection_t)
+
+    if popularity_preference == POPULARITY_POPULAR:
+        # Consideriamo i brani la cui proiezione cade fra i due centri.
+        # Non imponiamo una soglia di distanza laterale non prevista dal metodo.
+        middle_pool = pool[pool["_trajectory_t"].gt(0) & pool["_trajectory_t"].lt(1)].copy()
+        middle_pool = middle_pool.sort_values("popularity", ascending=False, kind="stable")
+        if len(middle_pool) < 3 and not allow_partial:
+            return middle_pool.iloc[0:0].drop(columns=["_trajectory_t"], errors="ignore")
+        selected = middle_pool.head(3).copy()
+        selected = selected.sort_values("_trajectory_t", ascending=True, kind="stable")
+        return selected.drop(columns=["_trajectory_t"], errors="ignore").reset_index(drop=True)
+
+    # Preferenza per brani più rappresentativi del punto intermedio.
+    targets = intermediate_points(start_emotion, destination_emotion)
+    selected_rows = []
+    used_ids = set(str(value) for value in excluded_ids)
+
+    for target in targets:
+        remaining = pool[~pool["id"].astype(str).isin(used_ids)].copy()
+        if remaining.empty:
+            if allow_partial:
+                continue
+            return candidates.iloc[0:0].copy()
+
+        remaining["_target_distance"] = np.sqrt(
+            (remaining["valence_va"] - target[0]) ** 2
+            + (remaining["arousal_va"] - target[1]) ** 2
         )
+        best = remaining.sort_values("_target_distance", ascending=True, kind="stable").head(1)
+        if best.empty:
+            if allow_partial:
+                continue
+            return candidates.iloc[0:0].copy()
+
+        selected_rows.append(best.drop(columns=["_target_distance", "_trajectory_t"]))
+        used_ids.add(str(best.iloc[0]["id"]))
+
+    if len(selected_rows) < 3 and not allow_partial:
+        return candidates.iloc[0:0].copy()
+    if not selected_rows:
+        return candidates.iloc[0:0].copy()
+
+    return pd.concat(selected_rows, ignore_index=True)
+
+
+def build_wellbeing_playlist(candidates, start_emotion, destination_emotion,
+                             popularity_preference, allow_partial=False):
+    """Crea la sequenza 2 partenza + 3 intermedi + 2 arrivo."""
+    if candidates.empty:
+        return candidates.copy() if allow_partial else None
+
+    start_songs = select_endpoint_songs(
+        candidates, start_emotion, 2, popularity_preference, excluded_ids=set()
+    )
+    end_songs = select_endpoint_songs(
+        candidates, destination_emotion, 2, popularity_preference,
+        excluded_ids=set(start_songs["id"].astype(str))
+    )
+
+    if not allow_partial and (len(start_songs) < 2 or len(end_songs) < 2):
+        return None
+
+    endpoint_ids = set(start_songs["id"].astype(str)) | set(end_songs["id"].astype(str))
+    middle_songs = select_middle_songs(
+        candidates=candidates,
+        start_emotion=start_emotion,
+        destination_emotion=destination_emotion,
+        popularity_preference=popularity_preference,
+        excluded_ids=endpoint_ids,
+        allow_partial=allow_partial,
+    )
+
+    if not allow_partial and len(middle_songs) < 3:
+        return None
+
+    playlist = pd.concat(
+        [start_songs, middle_songs, end_songs],
+        ignore_index=True,
+    )
+    playlist = playlist.drop_duplicates(subset="id", keep="first")
+
+    if not allow_partial and len(playlist) != 7:
+        return None
+
+    return playlist.reset_index(drop=True)
+
+
+def generate_wellbeing_playlist(start_emotion, preferences, target_songs=7):
+    """Costruisce il percorso emotivo e rilassa lingua, poi periodo.
+
+    Il genere rimane obbligatorio. Gli estremi sono vincolati alle emozioni
+    di partenza e destinazione; le canzoni intermedie vengono scelte nel piano VA.
+    """
+    destination = WELLBEING_DESTINATIONS[start_emotion]
+    all_songs = load_all_music_datasets()
+    last_candidates = all_songs.iloc[0:0].copy()
+
+    for tier in (0, 1, 2):
+        candidates = filter_by_preferences(all_songs, preferences, tier)
+        last_candidates = candidates
+        playlist = build_wellbeing_playlist(
+            candidates=candidates,
+            start_emotion=start_emotion,
+            destination_emotion=destination,
+            popularity_preference=preferences["popularity_preference"],
+            allow_partial=(tier == 2),
+        )
+
+        if playlist is not None and (len(playlist) == target_songs or tier == 2):
+            return playlist.head(target_songs).reset_index(drop=True), tier > 0 or len(playlist) < target_songs, destination
+
+    # Normalmente il codice torna dal livello 2. Questo è un fallback prudenziale.
+    partial = build_wellbeing_playlist(
+        candidates=last_candidates,
+        start_emotion=start_emotion,
+        destination_emotion=destination,
+        popularity_preference=preferences["popularity_preference"],
+        allow_partial=True,
+    )
+    if partial is None:
+        partial = all_songs.iloc[0:0].copy()
+    return partial.head(target_songs).reset_index(drop=True), True, destination
+
+
+def generate_playlist_for_mode(emotion, mode, preferences):
+    if mode == "coerente":
+        playlist, fallback_used = generate_coherent_playlist(
+            emotion=emotion,
+            preferences=preferences,
+            target_songs=7,
+        )
+        return playlist, fallback_used, None
+
+    if mode == "benessere":
+        playlist, fallback_used, destination = generate_wellbeing_playlist(
+            start_emotion=emotion,
+            preferences=preferences,
+            target_songs=7,
+        )
+        return playlist, fallback_used, destination
+
+    raise ValueError(f"Modalità playlist non riconosciuta: {mode}")
 
 
 # ============================================================
-# GENERAZIONE DELLA PLAYLIST
-# ============================================================
-
-def generate_playlist(
-    music_df,
-    preferred_language,
-    start_year,
-    end_year,
-    preferred_genre,
-    popularity_preference,
-    target_songs=7
-):
-
-    music_language = language_mapping[
-        preferred_language
-    ]
-
-    music_genre = genre_mapping[
-        preferred_genre
-    ]
-
-    selected_blocks = []
-
-    selected_ids = set()
-
-    def current_total():
-
-        return sum(
-            len(block)
-            for block in selected_blocks
-        )
-
-    def add_block(block_df):
-
-        nonlocal selected_blocks
-        nonlocal selected_ids
-
-        if block_df.empty:
-
-            return 0
-
-        # ----------------------------------------------------
-        # EVITIAMO DI INSERIRE DUE VOLTE LA STESSA CANZONE
-        # ----------------------------------------------------
-
-        block_df = block_df[
-            ~block_df["id"]
-            .astype(str)
-            .isin(selected_ids)
-        ].copy()
-
-        if block_df.empty:
-
-            return 0
-
-        # ----------------------------------------------------
-        # OGNI BLOCCO VIENE ORDINATO SEPARATAMENTE
-        # ----------------------------------------------------
-
-        block_df = rank_block(
-            block_df,
-            popularity_preference
-        )
-
-        # ----------------------------------------------------
-        # CALCOLIAMO QUANTI POSTI SONO ANCORA DISPONIBILI
-        # ----------------------------------------------------
-
-        remaining_slots = (
-            target_songs
-            -
-            current_total()
-        )
-
-        if remaining_slots <= 0:
-
-            return 0
-
-        # ----------------------------------------------------
-        # PRENDIAMO SOLO LE CANZONI NECESSARIE
-        # ----------------------------------------------------
-
-        block_df = block_df.head(
-            remaining_slots
-        ).copy()
-
-        # ----------------------------------------------------
-        # SALVIAMO GLI ID GIÀ UTILIZZATI
-        # ----------------------------------------------------
-
-        selected_ids.update(
-            block_df["id"].astype(str)
-        )
-
-        # ----------------------------------------------------
-        # MANTENIAMO IL BLOCCO SEPARATO
-        # ----------------------------------------------------
-        #
-        # Questo è importante:
-        # le canzoni di un blocco successivo NON vengono
-        # rimescolate insieme alle canzoni dei blocchi precedenti.
-        #
-
-        selected_blocks.append(
-            block_df
-        )
-
-        return len(block_df)
-
-    # ========================================================
-    # BLOCCO 1
-    # MOOD + GENERE + PERIODO + LINGUA
-    # ========================================================
-    #
-    # Il mood è già garantito dal dataset musicale caricato.
-    #
-    # Questo è il livello che rispetta TUTTE le preferenze.
-    # ========================================================
-
-    block_1 = music_df[
-        (music_df["genre"] == music_genre)
-        &
-        (music_df["year"] >= start_year)
-        &
-        (music_df["year"] <= end_year)
-        &
-        (music_df["language"] == music_language)
-    ].copy()
-
-    full_criteria_count = len(block_1)
-
-    add_block(
-        block_1
-    )
-
-    # ========================================================
-    # BLOCCO 2
-    # MOOD + GENERE + PERIODO
-    # ========================================================
-    #
-    # Se non sono bastate le canzoni del primo blocco,
-    # eliminiamo SOLO il criterio della lingua.
-    #
-    # Genere e periodo rimangono obbligatori.
-    # ========================================================
-
-    if current_total() < target_songs:
-
-        block_2 = music_df[
-            (music_df["genre"] == music_genre)
-            &
-            (music_df["year"] >= start_year)
-            &
-            (music_df["year"] <= end_year)
-        ].copy()
-
-        add_block(
-            block_2
-        )
-
-    # ========================================================
-    # BLOCCO 3
-    # MOOD + GENERE
-    # ========================================================
-    #
-    # Se non sono ancora bastate 7 canzoni,
-    # eliminiamo anche il criterio del periodo.
-    #
-    # Il genere rimane obbligatorio.
-    # ========================================================
-
-    if current_total() < target_songs:
-
-        block_3 = music_df[
-            music_df["genre"] == music_genre
-        ].copy()
-
-        add_block(
-            block_3
-        )
-
-    # ========================================================
-    # BLOCCO 4
-    # MOOD
-    # ========================================================
-    #
-    # Se non sono ancora bastate 7 canzoni,
-    # eliminiamo anche il genere.
-    #
-    # Rimane SEMPRE il mood determinato dalla voce.
-    # ========================================================
-
-    if current_total() < target_songs:
-
-        block_4 = music_df.copy()
-
-        add_block(
-            block_4
-        )
-
-    # ========================================================
-    # RISULTATO FINALE
-    # ========================================================
-
-    if not selected_blocks:
-
-        playlist = pd.DataFrame(
-            columns=music_df.columns
-        )
-
-    else:
-
-        playlist = pd.concat(
-            selected_blocks,
-            ignore_index=True
-        )
-
-    # ========================================================
-    # VERIFICA SE È STATO NECESSARIO RILASSARE I CRITERI
-    # ========================================================
-    #
-    # Il messaggio viene mostrato solamente se non erano
-    # disponibili almeno 7 canzoni che rispettassero
-    # contemporaneamente:
-    #
-    # mood + genere + periodo + lingua
-    #
-    # Non importa quale blocco sia poi servito per completare
-    # la playlist.
-    # ========================================================
-
-    fallback_used = (
-        full_criteria_count < target_songs
-    )
-
-    return (
-        playlist,
-        fallback_used
-    )
-
-
-# ============================================================
-# CREAZIONE LINK SPOTIFY
+# LINK SPOTIFY E YOUTUBE
 # ============================================================
 
 def create_spotify_link(song_id):
+    return f"https://open.spotify.com/track/{str(song_id).strip()}"
 
-    song_id = str(
-        song_id
-    ).strip()
 
-    return (
-        f"https://open.spotify.com/track/{song_id}"
-    )
+def create_youtube_link(title, artist):
+    query = quote_plus(f"{artist} {title}")
+    return f"https://www.youtube.com/results?search_query={query}"
 
 
 # ============================================================
-# CREAZIONE LINK YOUTUBE
+# TITOLO E INTRODUZIONE
 # ============================================================
 
-def create_youtube_link(
-    title,
-    artist
-):
-
-    query = quote_plus(
-        f"{artist} {title}"
-    )
-
-    return (
-        "https://www.youtube.com/results?search_query="
-        +
-        query
-    )
-
-
-# ============================================================
-# TITOLO
-# ============================================================
-
-st.title(
-    "🎵 Emozioni, voce e musica"
-)
-
+st.title("🎵 Emozioni, voce e musica")
 st.subheader(
-    "Un progetto di tesi sulla relazione tra "
-    "emozioni vocali e preferenze musicali"
+    "Un progetto di tesi sulla relazione tra emozioni vocali e preferenze musicali"
 )
 
+st.write(
+    """Ciao! 👋
 
-# ============================================================
-# INTRODUZIONE
-# ============================================================
+Sono una studentessa dell'Università degli Studi di Modena e Reggio Emilia e sto
+realizzando questo progetto nell'ambito della mia tesi di laurea nel corso di
+studi in Pubblicità, Comunicazione Digitale e Creatività d'Impresa.
 
-st.write("""
-Ciao! 👋
-
-Sono una studentessa dell'Università degli Studi di Modena e Reggio Emilia
-e sto realizzando questo progetto nell'ambito della mia tesi di laurea
-nel corso di studi in Pubblicità, Comunicazione Digitale e Creatività d'Impresa.
-
-Questa pagina web è stata realizzata per esplorare la relazione tra le emozioni
-espresse attraverso la voce e le preferenze musicali.
-
-Durante questa esperienza ti verranno poste alcune brevi domande sulle tue
-preferenze musicali. Successivamente ti sarà richiesto di registrare la tua voce
-pronunciando alcune semplici frasi.
-
-La registrazione verrà analizzata per stimare quale emozione risulta maggiormente
-espressa attraverso le caratteristiche acustiche della tua voce.
-
-In base al risultato ottenuto e alle preferenze musicali indicate, ti verrà
-successivamente proposta una playlist musicale.
-
-Al termine dell'ascolto potrai inoltre compilare un breve questionario finale
-per valutare la playlist ricevuta e fornire alcune informazioni utili
-all'analisi dei risultati del progetto.
-""")
-
-
+Questa pagina web esplora la relazione tra le emozioni espresse attraverso la
+voce e le preferenze musicali. Ti verranno poste alcune domande sulle preferenze
+musicali e ti sarà richiesto di registrare la voce pronunciando due semplici
+frasi. In base all'analisi della voce e alle preferenze indicate, riceverai una
+playlist. Al termine potrai valutare la playlist attraverso un breve questionario."""
+)
 st.divider()
 
 
 # ============================================================
-# QUESTIONARIO SULLE PREFERENZE MUSICALI
+# QUESTIONARIO PRE-REGISTRAZIONE
+# Tutte le risposte obbligatorie partono senza selezione.
 # ============================================================
 
-st.header(
-    "🎧 Le tue preferenze musicali"
-)
+st.header("🎧 Le tue preferenze musicali")
+st.write("Prima di registrare la voce, rispondi a tutte le domande seguenti.")
 
-st.write("""
-Prima di procedere con la registrazione della voce, rispondi alle seguenti
-domande sulle tue preferenze musicali.
-""")
+GENRE_OPTIONS = [
+    "Rock", "Pop", "Elettronica", "Folk", "Country", "Hip-Hop",
+    "Rhythm and Blues", "Jazz", "Blues", "Colonne sonore e musica classica",
+]
+LANGUAGE_OPTIONS = ["Italiano", "Inglese", "Spagnolo", "Portoghese", "Francese", "Tedesco"]
+EMOTION_OPTIONS_IT = [
+    "Neutro", "Calmo", "Felice", "Triste", "Arrabbiato",
+    "Impaurito", "Disgustato", "Sorpreso",
+]
+YEARS = list(range(1900, 2026))
 
-
-# ============================================================
-# GENERE MUSICALE
-# ============================================================
-
+# Non blocchiamo i campi dopo l'analisi: le preferenze usate nella playlist
+# vengono comunque salvate in sessione al momento dell'invio dell'analisi.
 genere = st.selectbox(
     "Qual è il tuo genere musicale preferito?",
-    [
-        "Rock",
-        "Pop",
-        "Elettronica",
-        "Folk",
-        "Country",
-        "Hip-Hop",
-        "Rhythm and Blues",
-        "Jazz",
-        "Blues",
-        "Colonne sonore e musica classica"
-    ]
+    GENRE_OPTIONS,
+    index=None,
+    placeholder="Seleziona un genere",
+    key="pref_genere",
 )
-
-
-# ============================================================
-# LINGUA
-# ============================================================
 
 lingua = st.selectbox(
     "In quale lingua preferisci ascoltare musica?",
-    [
-        "Italiano",
-        "Inglese",
-        "Spagnolo",
-        "Portoghese",
-        "Francese",
-        "Tedesco"
-    ]
-)
-
-
-# ============================================================
-# PERIODO MUSICALE
-# ============================================================
-
-years = list(
-    range(
-        1970,
-        2026
-    )
+    LANGUAGE_OPTIONS,
+    index=None,
+    placeholder="Seleziona una lingua",
+    key="pref_lingua",
 )
 
 anno_inizio = st.selectbox(
     "Da quale anno vuoi ascoltare musica?",
-    years,
-    index=years.index(2000)
+    YEARS,
+    index=None,
+    placeholder="Seleziona l'anno iniziale",
+    key="pref_anno_inizio",
 )
 
 anno_fine = st.selectbox(
     "Fino a quale anno vuoi ascoltare musica?",
-    years,
-    index=years.index(2002)
+    YEARS,
+    index=None,
+    placeholder="Seleziona l'anno finale",
+    key="pref_anno_fine",
 )
 
-if anno_fine < anno_inizio:
-
-    st.warning(
-        "⚠️ L'anno finale deve essere uguale o successivo "
-        "all'anno iniziale."
-    )
-
-
-# ============================================================
-# POPOLARITÀ DELLE CANZONI
-# ============================================================
+if anno_inizio is not None and anno_fine is not None and anno_fine < anno_inizio:
+    st.warning("L'anno finale deve essere uguale o successivo all'anno iniziale.")
 
 popularity_preference = st.radio(
     "Preferisci ascoltare canzoni popolari o canzoni poco conosciute?",
-    [
-        "Canzoni popolari",
-        "Canzoni poco conosciute"
-    ]
+    [POPULARITY_POPULAR, POPULARITY_NICHE],
+    index=None,
+    key="pref_popolarita",
 )
 
-
-st.divider()
-
-
-# ============================================================
-# EMOZIONE DICHIARATA
-# ============================================================
-
-st.header(
-    "💭 Come ti senti in questo momento?"
+st.subheader("💭 Come ti senti in questo momento?")
+st.write(
+    "Scegli l'emozione o lo stato d'animo che ritieni maggiormente rappresentativo "
+    "di come ti senti in questo momento. La risposta sarà confrontata con quella "
+    "stimata successivamente attraverso l'analisi della voce."
 )
-
-st.write("""
-Scegli l'emozione o lo stato d'animo che ritieni maggiormente
-rappresentativo di come ti senti in questo momento.
-
-Questa risposta verrà utilizzata anche per confrontare la tua percezione
-personale con l'emozione stimata successivamente attraverso l'analisi
-della voce.
-""")
-
 
 emozione_dichiarata = st.radio(
     "Come descriveresti il tuo stato emotivo attuale?",
-    [
-        "Neutro",
-        "Calmo",
-        "Felice",
-        "Triste",
-        "Arrabbiato/Energetico",
-        "Impaurito",
-        "Disgustato",
-        "Sorpreso"
-    ]
+    EMOTION_OPTIONS_IT,
+    index=None,
+    key="pref_emozione_dichiarata",
 )
-
 
 st.divider()
 
@@ -1213,717 +861,336 @@ st.divider()
 # REGISTRAZIONE DELLA VOCE
 # ============================================================
 
-st.header(
-    "🎙️ Registrazione della voce"
-)
-
-st.write("""
-Ora ti verrà chiesto di pronunciare due semplici frasi.
-
-Pronuncia ciascuna frase cercando di far trasparire attraverso la voce
-il tuo stato emotivo attuale.
-
-Non cercare di interpretare artificialmente un'emozione:
-pronuncia le frasi nel modo più naturale possibile, lasciando emergere
-il tuo stato d'animo attraverso il tono della voce,
-l'intonazione e l'intensità.
-""")
-
-
-# ============================================================
-# PRIMA REGISTRAZIONE
-# ============================================================
-
-st.subheader(
-    "Registrazione 1"
-)
-
+st.header("🎙️ Registrazione della voce")
 st.write(
-    "Pronuncia la seguente frase:"
+    "Pronuncia ciascuna frase cercando di far trasparire attraverso la voce il "
+    "tuo stato emotivo attuale. Non cercare di interpretare artificialmente "
+    "un'emozione: parla nel modo più naturale possibile."
 )
 
-st.info(
-    "🗣️ «I bambini stanno parlando vicino alla porta.»"
-)
+st.subheader("Registrazione 1")
+st.write("Pronuncia la seguente frase:")
+st.info("🗣️ «I bambini stanno parlando vicino alla porta.»")
+audio_1 = st.audio_input("Registra la prima frase", sample_rate=48000, key="audio_1")
 
-audio_1 = st.audio_input(
-    "Registra la prima frase",
-    sample_rate=48000,
-    key="audio_1"
-)
-
-
-# ============================================================
-# SECONDA REGISTRAZIONE
-# ============================================================
-
-st.subheader(
-    "Registrazione 2"
-)
-
-st.write(
-    "Pronuncia la seguente frase:"
-)
-
-st.info(
-    "🗣️ «I cani sono seduti vicino alla porta.»"
-)
-
-audio_2 = st.audio_input(
-    "Registra la seconda frase",
-    sample_rate=48000,
-    key="audio_2"
-)
-
+st.subheader("Registrazione 2")
+st.write("Pronuncia la seguente frase:")
+st.info("🗣️ «I cani sono seduti vicino alla porta.»")
+audio_2 = st.audio_input("Registra la seconda frase", sample_rate=48000, key="audio_2")
 
 st.divider()
 
 
 # ============================================================
-# RIEPILOGO
+# RIEPILOGO DELLE RISPOSTE PRE-REGISTRAZIONE
 # ============================================================
 
-st.header(
-    "📋 Riepilogo"
-)
-
+st.header("📋 Riepilogo")
+st.write("Prima di procedere, verifica le informazioni inserite.")
+st.write(f"**Genere musicale preferito:** {genere if genere is not None else 'Non selezionato'}")
+st.write(f"**Lingua preferita:** {lingua if lingua is not None else 'Non selezionata'}")
 st.write(
-    "Prima di procedere, verifica le informazioni inserite."
+    "**Periodo musicale preferito:** "
+    f"{anno_inizio if anno_inizio is not None else '—'}–"
+    f"{anno_fine if anno_fine is not None else '—'}"
 )
-
 st.write(
-    f"**Genere musicale preferito:** {genere}"
+    "**Preferenza:** "
+    f"{popularity_preference if popularity_preference is not None else 'Non selezionata'}"
 )
-
 st.write(
-    f"**Lingua preferita:** {lingua}"
+    "**Emozione dichiarata:** "
+    f"{emozione_dichiarata if emozione_dichiarata is not None else 'Non selezionata'}"
 )
-
-st.write(
-    f"**Periodo musicale preferito:** "
-    f"{anno_inizio}–{anno_fine}"
-)
-
-st.write(
-    f"**Preferenza di popolarità:** {popularity_preference}"
-)
-
-st.write(
-    f"**Emozione dichiarata:** {emozione_dichiarata}"
-)
-
-
-# ============================================================
-# ANALISI
-# ============================================================
 
 st.divider()
+procedi = st.button("Analizza la mia voce 🎵", type="primary", use_container_width=True)
 
-procedi = st.button(
-    "Analizza la mia voce 🎵"
-)
 
+# ============================================================
+# AVVIO DELL'ANALISI VOCALE
+# ============================================================
 
 if procedi:
+    missing_pre_answers = []
+    if genere is None:
+        missing_pre_answers.append("genere musicale")
+    if lingua is None:
+        missing_pre_answers.append("lingua")
+    if anno_inizio is None:
+        missing_pre_answers.append("anno iniziale")
+    if anno_fine is None:
+        missing_pre_answers.append("anno finale")
+    if popularity_preference is None:
+        missing_pre_answers.append("preferenza di popolarità")
+    if emozione_dichiarata is None:
+        missing_pre_answers.append("emozione dichiarata")
 
-    if anno_fine < anno_inizio:
-
-        st.error(
-            "❌ Seleziona un periodo valido: "
-            "l'anno finale deve essere uguale o successivo "
-            "all'anno iniziale."
-        )
-
+    if missing_pre_answers:
+        st.error("Rispondi a tutte le domande prima di inviare le tue risposte.")
+    elif anno_fine < anno_inizio:
+        st.error("Seleziona un periodo valido: l'anno finale deve essere uguale o successivo all'anno iniziale.")
     elif audio_1 is None or audio_2 is None:
-
-        st.warning(
-            "⚠️ Per continuare è necessario registrare entrambe le frasi."
-        )
-
+        st.error("Registra entrambe le frasi prima di avviare l'analisi.")
     else:
-
         try:
+            with st.spinner("Analisi della voce in corso..."):
+                final_emotion, _ = predict_emotion_from_two_recordings(audio_1, audio_2)
 
-            with st.spinner(
-                "Analisi della voce in corso..."
-            ):
+            st.session_state.final_emotion = final_emotion
+            st.session_state.preferenze_iniziali = {
+                "genre": genere,
+                "language": lingua,
+                "start_year": int(anno_inizio),
+                "end_year": int(anno_fine),
+                "popularity_preference": popularity_preference,
+            }
+            st.session_state.emozione_dichiarata_iniziale = emozione_dichiarata
+            st.session_state.analisi_completata = True
+            st.session_state.playlist_generata = False
+            st.session_state.playlist_df = None
+            st.session_state.playlist_fallback_used = False
+            st.session_state.playlist_mode = None
+            st.session_state.playlist_destination = None
+            st.session_state.questionario_aperto = False
+            st.session_state.risultato_salvato = False
 
-                # ====================================================
-                # ESTRAZIONE DELLE FEATURE
-                # ====================================================
-
-                features_1 = extract_mfcc_features(
-                    audio_1
-                )
-
-                features_2 = extract_mfcc_features(
-                    audio_2
-                )
-
-                # ====================================================
-                # STANDARDIZZAZIONE
-                # ====================================================
-
-                features_std_1 = scaler.transform(
-                    features_1[feature_cols]
-                )
-
-                features_std_2 = scaler.transform(
-                    features_2[feature_cols]
-                )
-
-                # ====================================================
-                # EMOZIONE DELLA PRIMA REGISTRAZIONE
-                # ====================================================
-
-                point_1 = features_std_1[0]
-
-                distances_1 = {}
-
-                for emotion in centroids.index:
-
-                    centroid = centroids.loc[
-                        emotion,
-                        feature_cols
-                    ].values.astype(float)
-
-                    distance = np.linalg.norm(
-                        point_1 - centroid
+            # Per happy, surprised, neutral e calm partiamo direttamente
+            # con la playlist coerente. Le altre emozioni richiedono una scelta.
+            if final_emotion not in EMOTIONS_WITH_MODE_QUESTION:
+                with st.spinner("Sto cercando le canzoni più adatte a te..."):
+                    playlist, fallback_used, destination = generate_playlist_for_mode(
+                        emotion=final_emotion,
+                        mode="coerente",
+                        preferences=st.session_state.preferenze_iniziali,
                     )
-
-                    distances_1[emotion] = distance
-
-                if not distances_1:
-
-                    raise ValueError(
-                        "Non sono state calcolate distanze "
-                        "per la prima registrazione."
-                    )
-
-                emotion_1 = min(
-                    distances_1,
-                    key=distances_1.get
-                )
-
-                # ====================================================
-                # EMOZIONE DELLA SECONDA REGISTRAZIONE
-                # ====================================================
-
-                point_2 = features_std_2[0]
-
-                distances_2 = {}
-
-                for emotion in centroids.index:
-
-                    centroid = centroids.loc[
-                        emotion,
-                        feature_cols
-                    ].values.astype(float)
-
-                    distance = np.linalg.norm(
-                        point_2 - centroid
-                    )
-
-                    distances_2[emotion] = distance
-
-                if not distances_2:
-
-                    raise ValueError(
-                        "Non sono state calcolate distanze "
-                        "per la seconda registrazione."
-                    )
-
-                emotion_2 = min(
-                    distances_2,
-                    key=distances_2.get
-                )
-
-                # ====================================================
-                # CREAZIONE DEL PUNTO MEDIO
-                # ====================================================
-
-                mean_point = (
-                    features_std_1[0]
-                    +
-                    features_std_2[0]
-                ) / 2
-
-                # ====================================================
-                # DISTANZE DEL PUNTO MEDIO
-                # ====================================================
-
-                mean_distances = {}
-
-                for emotion in final_emotions:
-
-                    centroid = centroids.loc[
-                        emotion,
-                        feature_cols
-                    ].values.astype(float)
-
-                    distance = np.linalg.norm(
-                        mean_point - centroid
-                    )
-
-                    mean_distances[emotion] = distance
-
-                if not mean_distances:
-
-                    raise ValueError(
-                        "Non sono state calcolate le distanze "
-                        "per le quattro emozioni finali."
-                    )
-
-                # ====================================================
-                # EMOZIONE FINALE
-                # ====================================================
-
-                final_emotion = min(
-                    mean_distances,
-                    key=mean_distances.get
-                )
-
-                # Salviamo il risultato nella sessione.
-
-                st.session_state.final_emotion = final_emotion
-
-            # ========================================================
-            # GENERAZIONE DELLA PLAYLIST
-            # ========================================================
-
-            with st.spinner(
-                "Sto cercando le canzoni più adatte a te..."
-            ):
-
-                music_mood = emotion_to_music_mood[
-                    final_emotion
-                ]
-
-                music_df = load_music_dataset(
-                    music_mood
-                )
-
-                playlist_df, fallback_used = generate_playlist(
-                    music_df=music_df,
-                    preferred_language=lingua,
-                    start_year=anno_inizio,
-                    end_year=anno_fine,
-                    preferred_genre=genere,
-                    popularity_preference=popularity_preference,
-                    target_songs=7
-                )
-
-                # Salviamo playlist, mood e informazione
-                # sull'eventuale rilassamento dei criteri.
-
-                st.session_state.playlist_df = playlist_df
-
-                st.session_state.playlist_fallback_used = (
-                    fallback_used
-                )
-
-                st.session_state.music_mood = music_mood
-
-                st.session_state.analisi_completata = True
-
+                st.session_state.playlist_df = playlist
+                st.session_state.playlist_fallback_used = fallback_used
+                st.session_state.playlist_mode = "coerente"
+                st.session_state.playlist_destination = destination
                 st.session_state.playlist_generata = True
 
-                st.session_state.questionario_aperto = False
-
-        except Exception as e:
-
-            st.error(
-                "❌ Si è verificato un errore durante l'analisi."
-            )
-
-            st.exception(e)
+        except Exception as exc:
+            st.error("Si è verificato un errore durante l'analisi o la ricerca della playlist.")
+            st.exception(exc)
 
 
 # ============================================================
-# RISULTATO E PLAYLIST
+# RISULTATO DELL'EMOZIONE E SCELTA DELLA MODALITÀ
 # ============================================================
 
-if (
-    st.session_state.analisi_completata
-    and
-    st.session_state.playlist_generata
-):
-
+if st.session_state.analisi_completata:
     final_emotion = st.session_state.final_emotion
-
-    music_mood = st.session_state.music_mood
-
-    playlist_df = st.session_state.playlist_df
-
-    # ========================================================
-    # RISULTATO EMOZIONE
-    # ========================================================
+    declared_emotion_text = st.session_state.emozione_dichiarata_iniziale
+    declared_emotion = DECLARED_EMOTION_MAPPING[declared_emotion_text]
 
     st.divider()
+    st.success("Analisi completata! 🎉")
+    st.header("🧠 Emozione stimata")
+    st.subheader(EMOTION_ITALIAN.get(final_emotion, final_emotion.capitalize()))
 
-    st.success(
-        "Analisi completata! 🎉"
-    )
-
-    st.header(
-        "🧠 Emozione stimata"
-    )
-
-    st.subheader(
-        final_emotion.capitalize()
-    )
-
-    # ========================================================
-    # CONFRONTO CON EMOZIONE DICHIARATA
-    # ========================================================
-
-    declared_emotion_mapping = {
-        "Neutro": "neutral",
-        "Calmo": "calm",
-        "Felice": "happy",
-        "Triste": "sad",
-        "Arrabbiato/Energetico": "angry",
-        "Impaurito": "fearful",
-        "Disgustato": "disgust",
-        "Sorpreso": "surprised"
-    }
-
-    declared_emotion_normalized = (
-        declared_emotion_mapping[
-            emozione_dichiarata
-        ]
-    )
-
-    if final_emotion != declared_emotion_normalized:
-
+    if final_emotion != declared_emotion:
         st.info(
-            f"Hai indicato **{emozione_dichiarata}**, "
-            f"mentre l'analisi della voce ha stimato "
-            f"**{final_emotion.capitalize()}**."
+            f"Hai indicato **{declared_emotion_text}**, mentre l'analisi della voce "
+            f"ha stimato **{EMOTION_ITALIAN[final_emotion]}**."
         )
-
     else:
-
         st.info(
-            f"Hai indicato **{emozione_dichiarata}** "
-            "e l'analisi della voce ha stimato "
-            f"**{final_emotion.capitalize()}**."
+            f"Hai indicato **{declared_emotion_text}** e l'analisi della voce "
+            f"ha stimato **{EMOTION_ITALIAN[final_emotion]}**."
         )
 
-    # ========================================================
-    # VISUALIZZAZIONE PLAYLIST
-    # ========================================================
-
-    st.divider()
-
-    st.header(
-        "🎵 La tua playlist"
-    )
-
-    if playlist_df.empty:
-
-        st.warning(
-            "Non sono state trovate canzoni compatibili "
-            "con i criteri selezionati."
-        )
-
-    else:
-
-        # ====================================================
-        # MESSAGGIO DI ADATTAMENTO DEI CRITERI
-        # ====================================================
-        #
-        # Compare solamente se non erano disponibili almeno
-        # 7 canzoni che rispettassero contemporaneamente
-        # genere + periodo + lingua + mood.
-        # ====================================================
-
-        if st.session_state.playlist_fallback_used:
-
-            st.info(
-                "ℹ️ Non tutte le canzoni della playlist soddisfano "
-                "tutte le preferenze che hai indicato. "
-                "Abbiamo quindi adattato progressivamente i criteri "
-                "per trovare le canzoni più adatte tra quelle "
-                "disponibili nel dataset. 🎵"
-            )
-
+    if final_emotion in EMOTIONS_WITH_MODE_QUESTION and not st.session_state.playlist_generata:
+        st.divider()
+        st.header("🎵 Che tipo di playlist preferisci?")
         st.write(
-            f"Sono state selezionate "
-            f"**{len(playlist_df)} canzoni** "
-            f"coerenti con il tuo stato emotivo "
-            "e le tue preferenze."
+            "Puoi ascoltare una playlist coerente con il tuo stato d'animo attuale "
+            "oppure una playlist pensata per accompagnare gradualmente un percorso "
+            "emotivo verso un altro stato d'animo. Quest'ultima è una proposta musicale, "
+            "non una promessa di miglioramento del benessere psicologico."
         )
 
-        for position, (_, song) in enumerate(
-            playlist_df.iterrows(),
-            start=1
-        ):
+        mode_choice = st.radio(
+            "Preferisci una playlist:",
+            [
+                "Coerente con il mio stato d'animo attuale",
+                "Per accompagnare il mio benessere emotivo",
+            ],
+            index=None,
+            key="scelta_modalita_playlist",
+        )
 
-            spotify_url = create_spotify_link(
-                song["id"]
-            )
+        genera_playlist = st.button(
+            "Genera la playlist 🎶",
+            type="primary",
+            use_container_width=True,
+            key="genera_playlist_modalita",
+        )
 
-            youtube_url = create_youtube_link(
-                song["name"],
-                song["artists"]
-            )
+        if genera_playlist:
+            if mode_choice is None:
+                st.error("Seleziona una modalità prima di generare la playlist.")
+            else:
+                mode = "coerente" if mode_choice.startswith("Coerente") else "benessere"
+                try:
+                    with st.spinner("Sto costruendo la tua playlist..."):
+                        playlist, fallback_used, destination = generate_playlist_for_mode(
+                            emotion=final_emotion,
+                            mode=mode,
+                            preferences=st.session_state.preferenze_iniziali,
+                        )
+                    st.session_state.playlist_df = playlist
+                    st.session_state.playlist_fallback_used = fallback_used
+                    st.session_state.playlist_mode = mode
+                    st.session_state.playlist_destination = destination
+                    st.session_state.playlist_generata = True
+                    st.rerun()
+                except Exception as exc:
+                    st.error("Si è verificato un errore durante la generazione della playlist.")
+                    st.exception(exc)
 
-            st.subheader(
-                f"{position}. {song['name']}"
-            )
+    # ========================================================
+    # VISUALIZZAZIONE DELLA PLAYLIST
+    # ========================================================
 
-            st.write(
-                f"**Artista:** {song['artists']}"
-            )
-
-            st.write(
-                f"**Album:** {song['album_name']}"
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                st.link_button(
-                    "Spotify",
-                    spotify_url,
-                    use_container_width=True
-                )
-
-            with col2:
-
-                st.link_button(
-                    "YouTube",
-                    youtube_url,
-                    use_container_width=True
-                )
-
-
-        # ====================================================
-        # QUESTIONARIO FINALE
-        # ====================================================
+    if st.session_state.playlist_generata:
+        playlist_df = st.session_state.playlist_df
+        mode = st.session_state.playlist_mode
+        destination = st.session_state.playlist_destination
 
         st.divider()
+        st.header("🎵 La tua playlist")
 
-        st.header(
-            "🎧 Hai finito di ascoltare la playlist?"
-        )
+        if mode == "benessere" and destination:
+            st.write(
+                "Questa playlist è stata organizzata lungo un percorso tra "
+                f"**{EMOTION_ITALIAN[final_emotion].lower()}** e "
+                f"**{EMOTION_ITALIAN[destination].lower()}**, cercando di passare "
+                "gradualmente da un estremo all'altro."
+            )
+        else:
+            st.write(
+                "Questa playlist raccoglie canzoni associate all'emozione "
+                f"**{EMOTION_ITALIAN[final_emotion].lower()}**."
+            )
 
-        st.write(
-            "Quando hai finito di ascoltare le canzoni, "
-            "clicca sul pulsante qui sotto per rispondere "
-            "a poche domande sulla playlist."
-        )
+        if st.session_state.playlist_fallback_used:
+            st.info(
+                "Non tutte le canzoni rispettavano contemporaneamente tutte le "
+                "preferenze. Per cercare brani sufficienti, il sistema ha prima "
+                "allentato il vincolo sulla lingua e, se necessario, quello sul periodo. "
+                "Il genere e il percorso/emozione previsti sono stati mantenuti."
+            )
 
-        apri_questionario = st.button(
-            "Ho finito di ascoltare 🎶",
-            use_container_width=True
-        )
+        if playlist_df is None or playlist_df.empty:
+            st.warning(
+                "Non sono state trovate canzoni sufficienti con i vincoli selezionati. "
+                "Prova con un altro genere o un intervallo temporale più ampio."
+            )
+        else:
+            st.write(f"Sono state selezionate **{len(playlist_df)} canzoni**.")
+            if len(playlist_df) < 7:
+                st.warning(
+                    "Nel dataset non erano disponibili sette canzoni distinte che "
+                    "rispettassero i vincoli mantenuti. La playlist contiene quindi "
+                    f"{len(playlist_df)} brani."
+                )
 
-        if apri_questionario:
+            for position, (_, song) in enumerate(playlist_df.iterrows(), start=1):
+                spotify_url = create_spotify_link(song["id"])
+                youtube_url = create_youtube_link(song["name"], song["artists"])
+                st.subheader(f"{position}. {song['name']}")
+                st.write(f"**Artista:** {song['artists']}")
+                st.write(f"**Album:** {song['album_name']}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.link_button("Spotify", spotify_url, use_container_width=True)
+                with col2:
+                    st.link_button("YouTube", youtube_url, use_container_width=True)
 
-            st.session_state.questionario_aperto = True
+            # ====================================================
+            # APERTURA DEL QUESTIONARIO FINALE
+            # ====================================================
+            st.divider()
+            st.header("🎧 Hai finito di ascoltare la playlist?")
+            st.write(
+                "Quando hai finito di ascoltare le canzoni, clicca sul pulsante "
+                "qui sotto per rispondere a poche domande sulla playlist."
+            )
+            if st.button("Ho finito di ascoltare 🎶", use_container_width=True, key="apri_questionario_finale"):
+                st.session_state.questionario_aperto = True
+                st.rerun()
 
 
 # ============================================================
 # QUESTIONARIO FINALE
+# Tutte le risposte tranne il commento facoltativo partono vuote.
 # ============================================================
 
 if (
     st.session_state.analisi_completata
-    and
-    st.session_state.playlist_generata
-    and
-    st.session_state.questionario_aperto
-    and
-    not st.session_state.risultato_salvato
+    and st.session_state.playlist_generata
+    and st.session_state.questionario_aperto
+    and not st.session_state.risultato_salvato
+    and st.session_state.playlist_df is not None
+    and not st.session_state.playlist_df.empty
 ):
-
     playlist_df = st.session_state.playlist_df
-
     final_emotion = st.session_state.final_emotion
-
-    music_mood = st.session_state.music_mood
+    mode = st.session_state.playlist_mode
+    destination = st.session_state.playlist_destination
 
     st.divider()
+    st.header("📝 Questionario finale")
+    st.write("Rispondi alle seguenti domande pensando alla playlist che hai appena ascoltato.")
 
-    st.header(
-        "📝 Questionario finale"
-    )
-
-    st.write(
-        "Rispondi alle seguenti domande pensando alla playlist "
-        "che hai appena ascoltato."
-    )
-
-    # ========================================================
-    # CREAZIONE DELLE ETICHETTE DELLE CANZONI
-    # ========================================================
-
-    song_options = []
-
-    for position, (_, song) in enumerate(
-        playlist_df.iterrows(),
-        start=1
-    ):
-
-        song_title = str(
-            song["name"]
-        ).strip()
-
-        song_artist = str(
-            song["artists"]
-        ).strip()
-
-        song_id = str(
-            song["id"]
-        ).strip()
-
-        # ----------------------------------------------------
-        # AGGIUNGIAMO IL NUMERO DELLA POSIZIONE NELLA PLAYLIST
-        #
-        # Esempio:
-        # 1 — Titolo — Artista
-        # 2 — Titolo — Artista
-        # ...
-        # 7 — Titolo — Artista
-        # ----------------------------------------------------
-
-        song_label = (
-            f"{position} — {song_title} — {song_artist}"
+    song_labels = []
+    for position, (_, song) in enumerate(playlist_df.iterrows(), start=1):
+        song_labels.append(
+            f"{position} — {str(song['name']).strip()} — {str(song['artists']).strip()}"
         )
 
-        song_options.append(
-            {
-                "label": song_label,
-                "id": song_id
-            }
-        )
-
-    song_labels = [
-        song["label"]
-        for song in song_options
-    ]
-
-    # ========================================================
-    # DOMANDA 1
-    # ========================================================
-
-    st.subheader(
-        "1. Quanto ti è piaciuta la playlist?"
-    )
-
+    st.subheader("1. Quanto ti è piaciuta la playlist?")
     gradimento_playlist = st.radio(
         "Seleziona una risposta:",
-        [
-            "Per niente",
-            "Poco",
-            "Moderatamente",
-            "Molto",
-            "Moltissimo"
-        ],
-        key="gradimento_playlist"
+        ["Per niente", "Poco", "Moderatamente", "Molto", "Moltissimo"],
+        index=None,
+        key="final_gradimento_playlist",
     )
-
-    # ========================================================
-    # DOMANDA 2
-    # ========================================================
 
     st.subheader(
         "2. La playlist era coerente con il tuo stato emotivo?"
+        if mode == "coerente"
+        else "2. La playlist ti è sembrata coerente con il percorso emotivo proposto?"
     )
-
     coerenza_emotiva = st.radio(
         "Seleziona una risposta:",
-        [
-            "Per niente",
-            "Poco",
-            "Moderatamente",
-            "Molto",
-            "Moltissimo"
-        ],
-        key="coerenza_emotiva"
+        ["Per niente", "Poco", "Moderatamente", "Molto", "Moltissimo"],
+        index=None,
+        key="final_coerenza_emotiva",
     )
 
-    # ========================================================
-    # DOMANDA 3
-    # ========================================================
-
-    st.subheader(
-        "3. Quale canzone ti è piaciuta di più?"
-    )
-
+    st.subheader("3. Quale canzone ti è piaciuta di più?")
     canzone_preferita = st.radio(
-        "Seleziona una canzone:",
-        song_labels,
-        key="canzone_preferita"
+        "Seleziona una canzone:", song_labels, index=None, key="final_canzone_preferita"
     )
 
-    # ========================================================
-    # DOMANDA 4
-    # ========================================================
-
-    st.subheader(
-        "4. Quale canzone ti è piaciuta di meno?"
-    )
-
+    st.subheader("4. Quale canzone ti è piaciuta di meno?")
     canzone_meno_preferita = st.radio(
-        "Seleziona una canzone:",
-        song_labels,
-        key="canzone_meno_preferita"
+        "Seleziona una canzone:", song_labels, index=None, key="final_canzone_meno_preferita"
     )
 
-    # ========================================================
-    # DOMANDA 5
-    # ========================================================
-
-    st.subheader(
-        "5. Quante delle canzoni proposte dalla playlist "
-        "già conoscevi?"
-    )
-
-    numero_canzoni_playlist = len(
-        playlist_df
-    )
-
-    if numero_canzoni_playlist == 1:
-
-        known_options = [
-            "Nessuna",
-            "Tutte"
-        ]
-
+    st.subheader("5. Quante delle canzoni proposte già conoscevi?")
+    num_songs = len(playlist_df)
+    if num_songs <= 1:
+        known_options = ["Nessuna", "Tutte"]
     else:
-
-        known_options = (
-            ["Nessuna"]
-            +
-            [
-                str(number)
-                for number in range(
-                    1,
-                    numero_canzoni_playlist
-                )
-            ]
-            +
-            ["Tutte"]
-        )
-
+        known_options = ["Nessuna"] + [str(number) for number in range(1, num_songs)] + ["Tutte"]
     canzoni_gia_conosciute = st.radio(
-        "Seleziona una risposta:",
-        known_options,
-        key="canzoni_gia_conosciute"
+        "Seleziona una risposta:", known_options, index=None, key="final_canzoni_gia_conosciute"
     )
 
-    # ========================================================
-    # DOMANDA 6
-    # ========================================================
-
-    st.subheader(
-        "6. Quanto spesso ascolti musica al giorno?"
-    )
-
+    st.subheader("6. Quanto spesso ascolti musica al giorno?")
     frequenza_ascolto_musica = st.radio(
         "Seleziona una risposta:",
         [
@@ -1931,348 +1198,156 @@ if (
             "Da 30 minuti a meno di 1 ora",
             "Da 1 ora a meno di 2 ore",
             "Da 2 ore a meno di 3 ore",
-            "3 ore o più"
+            "3 ore o più",
         ],
-        key="frequenza_ascolto_musica"
+        index=None,
+        key="final_frequenza_ascolto_musica",
     )
 
-    # ========================================================
-    # DOMANDA 7
-    # ========================================================
-
-    st.subheader(
-        "7. Se c'è qualcosa che vuoi dire, faccelo sapere."
-    )
-
+    st.subheader("7. Se c'è qualcosa che vuoi dire, faccelo sapere (facoltativo).")
     commento = st.text_area(
-        "Commento",
-        placeholder=(
-            "Scrivi qui eventuali osservazioni, "
-            "commenti o suggerimenti..."
-        ),
-        key="commento"
+        "Commento facoltativo",
+        placeholder="Scrivi qui eventuali osservazioni, commenti o suggerimenti...",
+        key="final_commento",
     )
-
-    # ========================================================
-    # DOMANDE SOCIO-DEMOGRAFICHE
-    # ========================================================
 
     st.divider()
-
-    st.header(
-        "👤 Domande socio-demografiche"
-    )
-
-    # ========================================================
-    # GENERE
-    # ========================================================
-
-    genere_options = [
-        "Maschio",
-        "Femmina",
-        "Altro"
-    ]
+    st.header("👤 Domande socio-demografiche")
 
     genere_demografico = st.radio(
         "Indica il tuo genere:",
-        genere_options,
-        key="genere_demografico"
+        ["Maschio", "Femmina", "Altro"],
+        index=None,
+        key="final_genere_demografico",
     )
 
-    # ========================================================
-    # ETÀ
-    # ========================================================
-
-    age_options = (
-        ["Meno di 14 anni"]
-        +
-        [
-            str(age)
-            for age in range(
-                14,
-                81
-            )
-        ]
-        +
-        ["80 anni o più"]
-    )
-
+    age_options = ["Meno di 14 anni"] + [str(age) for age in range(14, 81)] + ["80 anni o più"]
     eta = st.selectbox(
         "Indica la tua età:",
         age_options,
-        key="eta"
+        index=None,
+        placeholder="Seleziona l'età",
+        key="final_eta",
     )
 
-    # ========================================================
-    # REGIONE DI RESIDENZA
-    # ========================================================
-
     region_options = [
-        "Abruzzo",
-        "Basilicata",
-        "Calabria",
-        "Campania",
-        "Emilia-Romagna",
-        "Friuli-Venezia Giulia",
-        "Lazio",
-        "Liguria",
-        "Lombardia",
-        "Marche",
-        "Molise",
-        "Piemonte",
-        "Puglia",
-        "Sardegna",
-        "Sicilia",
-        "Toscana",
-        "Trentino-Alto Adige",
-        "Umbria",
-        "Valle d'Aosta",
-        "Veneto",
-        "Vivo all'estero"
+        "Abruzzo", "Basilicata", "Calabria", "Campania", "Emilia-Romagna",
+        "Friuli-Venezia Giulia", "Lazio", "Liguria", "Lombardia", "Marche",
+        "Molise", "Piemonte", "Puglia", "Sardegna", "Sicilia", "Toscana",
+        "Trentino-Alto Adige", "Umbria", "Valle d'Aosta", "Veneto", "Vivo all'estero",
     ]
-
     regione_residenza = st.selectbox(
         "Indica la tua regione di residenza:",
         region_options,
-        key="regione_residenza"
+        index=None,
+        placeholder="Seleziona una regione",
+        key="final_regione_residenza",
     )
-
-    # ========================================================
-    # ISTRUZIONE
-    # ========================================================
-
-    istruzione_options = [
-        "Terza media",
-        "Diploma scuola superiore",
-        "Laurea triennale",
-        "Laurea magistrale a ciclo unico",
-        "Dottorato di ricerca"
-    ]
 
     istruzione = st.selectbox(
         "Indica il tuo titolo di studio:",
-        istruzione_options,
-        key="istruzione"
+        [
+            "Terza media",
+            "Diploma scuola superiore",
+            "Laurea triennale",
+            "Laurea magistrale a ciclo unico",
+            "Dottorato di ricerca",
+        ],
+        index=None,
+        placeholder="Seleziona un titolo di studio",
+        key="final_istruzione",
     )
-
-    # ========================================================
-    # INVIO QUESTIONARIO
-    # ========================================================
 
     st.divider()
-
     st.write(
-        "Quando hai completato tutte le domande, "
-        "clicca sul pulsante qui sotto per inviare "
-        "le tue risposte."
+        "Quando hai completato tutte le domande obbligatorie, clicca sul pulsante "
+        "qui sotto per inviare le tue risposte. Il commento è facoltativo."
     )
-
     invia_questionario = st.button(
         "Invia il questionario e termina 🎵",
         type="primary",
-        use_container_width=True
+        use_container_width=True,
+        key="invia_questionario_finale",
     )
 
     if invia_questionario:
+        required_answers = {
+            "gradimento della playlist": gradimento_playlist,
+            "coerenza della playlist": coerenza_emotiva,
+            "canzone preferita": canzone_preferita,
+            "canzone meno preferita": canzone_meno_preferita,
+            "numero di canzoni già conosciute": canzoni_gia_conosciute,
+            "frequenza di ascolto della musica": frequenza_ascolto_musica,
+            "genere": genere_demografico,
+            "età": eta,
+            "regione di residenza": regione_residenza,
+            "titolo di studio": istruzione,
+        }
+        missing_answers = [label for label, value in required_answers.items() if value is None]
 
-        try:
+        if missing_answers:
+            st.error("Rispondi a tutte le domande prima di inviare le tue risposte.")
+        else:
+            try:
+                with st.spinner("Salvataggio delle risposte in corso..."):
+                    results_df, _ = load_results_from_github()
+                    participant_id = generate_participant_id(results_df)
+                    timestamp = datetime.now(ZoneInfo("Europe/Rome")).isoformat(timespec="seconds")
+                    preferences = st.session_state.preferenze_iniziali
 
-            with st.spinner(
-                "Salvataggio delle risposte in corso..."
-            ):
+                    song_ids = [str(song["id"]).strip() for _, song in playlist_df.iterrows()]
+                    song_id_columns = {
+                        f"song_id_{index + 1}": song_ids[index] if index < len(song_ids) else pd.NA
+                        for index in range(7)
+                    }
 
-                # ====================================================
-                # LETTURA DEL FILE ATTUALE
-                # ====================================================
+                    new_row = {
+                        "id_partecipante": participant_id,
+                        "timestamp": timestamp,
+                        "genere_preferito": preferences["genre"],
+                        "lingua_preferita": preferences["language"],
+                        "anno_inizio": preferences["start_year"],
+                        "anno_fine": preferences["end_year"],
+                        "preferenza_popolarita": preferences["popularity_preference"],
+                        "emozione_dichiarata": st.session_state.emozione_dichiarata_iniziale,
+                        # Nel CSV manteniamo i codici interni inglesi, più facili da analizzare.
+                        "emozione_stimata": final_emotion,
+                        # La vecchia mappatura a quattro mood non è più usata nella playlist.
+                        "mood": pd.NA,
+                        "modalita_playlist": mode,
+                        "emozione_destinazione": destination if destination else pd.NA,
+                        "numero_canzoni": len(playlist_df),
+                        "gradimento_playlist": gradimento_playlist,
+                        "coerenza_emotiva": coerenza_emotiva,
+                        "canzone_preferita": canzone_preferita,
+                        "canzone_meno_preferita": canzone_meno_preferita,
+                        "canzoni_gia_conosciute": canzoni_gia_conosciute,
+                        "frequenza_ascolto_musica": frequenza_ascolto_musica,
+                        "commento": commento.strip() if commento else pd.NA,
+                        "genere": genere_demografico,
+                        "eta": eta,
+                        "regione_residenza": regione_residenza,
+                        "istruzione": istruzione,
+                    }
+                    new_row.update(song_id_columns)
+                    save_result_to_github(new_row)
+                    st.session_state.risultato_salvato = True
 
-                results_df, _ = load_results_from_github()
+                st.success("✅ Grazie! Le tue risposte sono state registrate correttamente.")
+                st.write("Puoi chiudere questa pagina.")
 
-                # ====================================================
-                # GENERAZIONE ID PARTECIPANTE
-                # ====================================================
-
-                participant_id = generate_participant_id(
-                    results_df
-                )
-
-                # ====================================================
-                # TIMESTAMP
-                # ====================================================
-
-                timestamp = datetime.now(
-                    ZoneInfo("Europe/Rome")
-                ).isoformat(
-                    timespec="seconds"
-                )
-
-                # ====================================================
-                # ID DELLE CANZONI
-                #
-                # Vengono presi direttamente dalla colonna "id"
-                # del dataset musicale.
-                # ====================================================
-
-                song_ids = [
-                    str(song["id"]).strip()
-                    for _, song
-                    in playlist_df.iterrows()
-                ]
-
-                # ====================================================
-                # PREPARIAMO song_id_1 ... song_id_7
-                # ====================================================
-
-                song_id_columns = {}
-
-                for index in range(7):
-
-                    column_name = (
-                        f"song_id_{index + 1}"
+            except RuntimeError as exc:
+                if str(exc) == "CONFLICT_GITHUB":
+                    st.error(
+                        "Si è verificato un conflitto durante il salvataggio dei dati su GitHub. "
+                        "Riprova tra qualche secondo."
                     )
-
-                    if index < len(song_ids):
-
-                        song_id_columns[
-                            column_name
-                        ] = song_ids[index]
-
-                    else:
-
-                        song_id_columns[
-                            column_name
-                        ] = pd.NA
-
-                # ====================================================
-                # CREAZIONE DELLA NUOVA RIGA
-                # ====================================================
-
-                new_row = {
-
-                    "id_partecipante":
-                        participant_id,
-
-                    "timestamp":
-                        timestamp,
-
-                    "genere_preferito":
-                        genere,
-
-                    "lingua_preferita":
-                        lingua,
-
-                    "anno_inizio":
-                        anno_inizio,
-
-                    "anno_fine":
-                        anno_fine,
-
-                    "preferenza_popolarita":
-                        popularity_preference,
-
-                    "emozione_dichiarata":
-                        emozione_dichiarata,
-
-                    "emozione_stimata":
-                        final_emotion,
-
-                    "mood":
-                        music_mood,
-
-                    "numero_canzoni":
-                        len(playlist_df),
-
-                    "gradimento_playlist":
-                        gradimento_playlist,
-
-                    "coerenza_emotiva":
-                        coerenza_emotiva,
-
-                    "canzone_preferita":
-                        canzone_preferita,
-
-                    "canzone_meno_preferita":
-                        canzone_meno_preferita,
-
-                    "canzoni_gia_conosciute":
-                        canzoni_gia_conosciute,
-
-                    "frequenza_ascolto_musica":
-                        frequenza_ascolto_musica,
-
-                    "commento":
-                        commento,
-
-                    "genere":
-                        genere_demografico,
-
-                    "eta":
-                        eta,
-
-                    "regione_residenza":
-                        regione_residenza,
-
-                    "istruzione":
-                        istruzione
-                }
-
-                # ====================================================
-                # AGGIUNGIAMO GLI ID DELLE CANZONI
-                # ====================================================
-
-                new_row.update(
-                    song_id_columns
-                )
-
-                # ====================================================
-                # SALVIAMO SU GITHUB
-                # ====================================================
-
-                save_result_to_github(
-                    new_row
-                )
-
-                # ====================================================
-                # SESSIONE COMPLETATA
-                # ====================================================
-
-                st.session_state.risultato_salvato = True
-
-            st.success(
-                "✅ Grazie! Le tue risposte sono state "
-                "registrate correttamente."
-            )
-
-            st.write(
-                "Puoi chiudere questa pagina."
-            )
-
-        except RuntimeError as e:
-
-            if str(e) == "CONFLICT_GITHUB":
-
-                st.error(
-                    "⚠️ Si è verificato un conflitto durante "
-                    "il salvataggio dei dati su GitHub. "
-                    "Riprova tra qualche secondo."
-                )
-
-            else:
-
-                st.error(
-                    "❌ Si è verificato un errore durante "
-                    "il salvataggio del questionario."
-                )
-
-                st.exception(e)
-
-        except Exception as e:
-
-            st.error(
-                "❌ Si è verificato un errore durante "
-                "il salvataggio del questionario."
-            )
-
-            st.exception(e)
+                else:
+                    st.error("Si è verificato un errore durante il salvataggio del questionario.")
+                    st.exception(exc)
+            except Exception as exc:
+                st.error("Si è verificato un errore durante il salvataggio del questionario.")
+                st.exception(exc)
 
 
 # ============================================================
@@ -2280,10 +1355,5 @@ if (
 # ============================================================
 
 if st.session_state.risultato_salvato:
-
     st.divider()
-
-    st.success(
-        "🎉 Questionario completato! "
-        "Grazie per aver partecipato al progetto."
-    )
+    st.success("🎉 Questionario completato! Grazie per aver partecipato al progetto.")
