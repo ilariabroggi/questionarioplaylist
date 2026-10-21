@@ -136,8 +136,8 @@ RESULTS_COLUMNS = [
     "emozione_dichiarata",
     "emozione_stimata",
     "mood",
-    "modalita_playlist",
-    "emozione_destinazione",
+    "requisiti_soddisfatti",
+    "coerenza_playlist",
     "numero_canzoni",
     "song_id_1",
     "song_id_2",
@@ -148,17 +148,21 @@ RESULTS_COLUMNS = [
     "song_id_7",
     "gradimento_playlist",
     "coerenza_emotiva",
+    "gusti_musicali",
     "canzone_preferita",
     "canzone_meno_preferita",
     "canzoni_gia_conosciute",
+    "commento_valutazione",
     "frequenza_ascolto_musica",
-    "commento",
+    "scoperta_musica",
+    "playlist_mood",
+    "scelta_algoritmo",
+    "preferenza_musica_per_mood",
     "genere",
     "eta",
     "regione_residenza",
     "istruzione",
 ]
-
 
 def load_results_from_github():
     """Legge il CSV dei risultati e restituisce anche il suo SHA GitHub."""
@@ -210,10 +214,23 @@ def save_result_to_github(new_row):
         results_df, file_sha = load_results_from_github()
         new_row_df = pd.DataFrame([new_row])
 
+        # Migra alcuni campi della vecchia versione prima di allineare lo schema.
+        # In questo modo i commenti e la modalità già raccolti non vengono persi.
+        if "coerenza_playlist" not in results_df.columns and "modalita_playlist" in results_df.columns:
+            results_df["coerenza_playlist"] = results_df["modalita_playlist"]
+        if "commento_valutazione" not in results_df.columns and "commento" in results_df.columns:
+            results_df["commento_valutazione"] = results_df["commento"]
+
+        # Allinea anche il CSV già presente su GitHub al nuovo schema:
+        # aggiunge le nuove colonne vuote per i vecchi partecipanti e rimuove
+        # le vecchie colonne non più utilizzate.
         for column in RESULTS_COLUMNS:
+            if column not in results_df.columns:
+                results_df[column] = pd.NA
             if column not in new_row_df.columns:
                 new_row_df[column] = pd.NA
 
+        results_df = results_df[RESULTS_COLUMNS]
         new_row_df = new_row_df[RESULTS_COLUMNS]
         updated_df = pd.concat([results_df, new_row_df], ignore_index=True)
         csv_content = updated_df.to_csv(index=False)
@@ -762,17 +779,41 @@ st.subheader(
 )
 
 st.write(
-    """Ciao! 👋
+    """Gentile partecipante,
 
-Sono una studentessa dell'Università degli Studi di Modena e Reggio Emilia e sto
-realizzando questo progetto nell'ambito della mia tesi di laurea nel corso di
-studi in Pubblicità, Comunicazione Digitale e Creatività d'Impresa.
+Ti ringraziamo per aver scelto di partecipare a questo questionario sviluppato
+da una laureanda dell'Università degli Studi di Modena e Reggio Emilia.
 
-Questa pagina web esplora la relazione tra le emozioni espresse attraverso la
-voce e le preferenze musicali. Ti verranno poste alcune domande sulle preferenze
-musicali e ti sarà richiesto di registrare la voce pronunciando due semplici
-frasi. In base all'analisi della voce e alle preferenze indicate, riceverai una
-playlist. Al termine potrai valutare la playlist attraverso un breve questionario."""
+Prima di procedere con la compilazione, ti preghiamo di leggere attentamente le
+seguenti informazioni riguardanti la privacy e l'utilizzo delle tue risposte.
+
+Tutte le informazioni raccolte in questa ricerca saranno trattate nel rispetto
+delle vigenti leggi D.Lgs. 196/2003 sulla privacy e UE GDPR 679/2016 sulla
+protezione dei dati personali. Ti chiediamo di non includere informazioni
+personali sensibili o identificabili nelle risposte al questionario, come nomi
+completi, indirizzi, numeri di telefono, indirizzi email, numeri di documenti
+d'identità o altre informazioni che potrebbero identificarti direttamente.
+
+I dati, raccolti ed elaborati in forma aggregata e anonima, potranno essere
+inseriti in pubblicazioni e/o presentati a congressi, seminari o lezioni.
+Proseguendo con la compilazione del questionario, confermi di aver letto e
+compreso le avvertenze sulla privacy, di essere maggiorenne, di aderire
+volontariamente alla realizzazione della ricerca in qualità di partecipante,
+di essere a conoscenza che i dati ricavati, nell'assoluto anonimato, saranno
+trattati esclusivamente per fini didattici e di ricerca e di essere consapevole
+che è prevista la possibilità di ottenere la restituzione dei dati raccolti una
+volta inviati.
+
+Per eventuali chiarimenti è possibile contattare:
+
+Ilaria Broggi (302189@studenti.unimore.it)
+
+Grazie mille per il tuo prezioso contributo!"""
+)
+privacy_consent = st.checkbox(
+    "Ho letto e compreso l'informativa, dichiaro di essere maggiorenne e scelgo "
+    "volontariamente di partecipare alla ricerca.",
+    key="privacy_consent",
 )
 st.divider()
 
@@ -926,8 +967,11 @@ if procedi:
     if emozione_dichiarata is None:
         missing_pre_answers.append("emozione dichiarata")
 
+    if not privacy_consent:
+        missing_pre_answers.append("conferma di aver letto l'informativa privacy")
+
     if missing_pre_answers:
-        st.error("Rispondi a tutte le domande prima di inviare le tue risposte.")
+        st.error("Rispondi a tutte le domande e conferma l'informativa prima di procedere.")
     elif anno_fine < anno_inizio:
         st.error("Seleziona un periodo valido: l'anno finale deve essere uguale o successivo all'anno iniziale.")
     elif audio_1 is None or audio_2 is None:
@@ -1124,7 +1168,7 @@ if st.session_state.analisi_completata:
 
 # ============================================================
 # QUESTIONARIO FINALE
-# Tutte le risposte tranne il commento facoltativo partono vuote.
+# Tutte le risposte sono obbligatorie tranne il commento facoltativo.
 # ============================================================
 
 if (
@@ -1142,7 +1186,10 @@ if (
 
     st.divider()
     st.header("📝 Questionario finale")
-    st.write("Rispondi alle seguenti domande pensando alla playlist che hai appena ascoltato.")
+    st.write(
+        "Rispondi alle seguenti domande pensando alla playlist che hai appena ascoltato. "
+        "Il questionario è diviso in tre sezioni."
+    )
 
     song_labels = []
     for position, (_, song) in enumerate(playlist_df.iterrows(), start=1):
@@ -1150,47 +1197,110 @@ if (
             f"{position} — {str(song['name']).strip()} — {str(song['artists']).strip()}"
         )
 
-    st.subheader("1. Quanto ti è piaciuta la playlist?")
-    gradimento_playlist = st.radio(
-        "Seleziona una risposta:",
-        ["Per niente", "Poco", "Moderatamente", "Molto", "Moltissimo"],
+    # --------------------------------------------------------
+    # SEZIONE 1: VALUTAZIONE DELLA PLAYLIST
+    # --------------------------------------------------------
+    st.header("1. Valutazione della playlist")
+
+    scale_labels = [
+        "1 — Per nulla",
+        "2 — Poco",
+        "3 — Moderatamente",
+        "4 — Molto",
+        "5 — Moltissimo",
+    ]
+    scale_values = {label: int(label[0]) for label in scale_labels}
+
+    st.subheader("1.1 Quanto ti è piaciuta la playlist?")
+    gradimento_label = st.radio(
+        "1 = Per nulla; 5 = Moltissimo",
+        scale_labels,
         index=None,
         key="final_gradimento_playlist",
     )
+    gradimento_playlist = scale_values.get(gradimento_label)
 
     st.subheader(
-        "2. La playlist era coerente con il tuo stato emotivo?"
-        if mode == "coerente"
-        else "2. La playlist ti è sembrata coerente con il percorso emotivo proposto?"
+        "1.2 Quanto ritieni che la playlist fosse coerente con il tuo stato emotivo "
+        "al momento della registrazione?"
     )
-    coerenza_emotiva = st.radio(
-        "Seleziona una risposta:",
-        ["Per niente", "Poco", "Moderatamente", "Molto", "Moltissimo"],
+    coerenza_emotiva_label = st.radio(
+        "1 = Per nulla coerente; 5 = Completamente coerente",
+        [
+            "1 — Per nulla coerente",
+            "2 — Poco coerente",
+            "3 — Moderatamente coerente",
+            "4 — Molto coerente",
+            "5 — Completamente coerente",
+        ],
         index=None,
         key="final_coerenza_emotiva",
     )
+    coerenza_emotiva = (
+        int(coerenza_emotiva_label[0]) if coerenza_emotiva_label else None
+    )
 
-    st.subheader("3. Quale canzone ti è piaciuta di più?")
+    st.subheader("1.3 Quanto ritieni che la playlist fosse coerente con i tuoi gusti musicali?")
+    gusti_musicali_label = st.radio(
+        "1 = Per nulla coerente; 5 = Completamente coerente",
+        [
+            "1 — Per nulla coerente",
+            "2 — Poco coerente",
+            "3 — Moderatamente coerente",
+            "4 — Molto coerente",
+            "5 — Completamente coerente",
+        ],
+        index=None,
+        key="final_gusti_musicali",
+    )
+    gusti_musicali = int(gusti_musicali_label[0]) if gusti_musicali_label else None
+
+    st.subheader("1.4 Quale canzone ti è piaciuta di più?")
     canzone_preferita = st.radio(
-        "Seleziona una canzone:", song_labels, index=None, key="final_canzone_preferita"
+        "Seleziona una canzone:",
+        song_labels,
+        index=None,
+        key="final_canzone_preferita",
     )
 
-    st.subheader("4. Quale canzone ti è piaciuta di meno?")
+    st.subheader("1.5 Quale canzone ti è piaciuta di meno?")
     canzone_meno_preferita = st.radio(
-        "Seleziona una canzone:", song_labels, index=None, key="final_canzone_meno_preferita"
+        "Seleziona una canzone:",
+        song_labels,
+        index=None,
+        key="final_canzone_meno_preferita",
     )
 
-    st.subheader("5. Quante delle canzoni proposte già conoscevi?")
+    st.subheader("1.6 Quanti dei brani presenti nella playlist conoscevi già?")
     num_songs = len(playlist_df)
-    if num_songs <= 1:
-        known_options = ["Nessuna", "Tutte"]
-    else:
-        known_options = ["Nessuna"] + [str(number) for number in range(1, num_songs)] + ["Tutte"]
-    canzoni_gia_conosciute = st.radio(
-        "Seleziona una risposta:", known_options, index=None, key="final_canzoni_gia_conosciute"
+    known_options = ["Nessuno"] + [str(number) for number in range(1, num_songs + 1)]
+    known_options_map = {"Nessuno": 0, **{str(n): n for n in range(1, num_songs + 1)}}
+    canzoni_gia_conosciute_label = st.radio(
+        "Indica il numero di brani che conoscevi già:",
+        known_options,
+        index=None,
+        key="final_canzoni_gia_conosciute",
+    )
+    canzoni_gia_conosciute = (
+        known_options_map.get(canzoni_gia_conosciute_label)
+        if canzoni_gia_conosciute_label is not None
+        else None
     )
 
-    st.subheader("6. Quanto spesso ascolti musica al giorno?")
+    st.subheader("1.7 Se vuoi, puoi lasciare un commento sulla playlist o spiegare cosa avresti cambiato.")
+    commento_valutazione = st.text_area(
+        "Commento facoltativo",
+        placeholder="Scrivi qui eventuali osservazioni, commenti o suggerimenti...",
+        key="final_commento_valutazione",
+    )
+
+    # --------------------------------------------------------
+    # SEZIONE 2: PROFILO MUSICALE DELL'UTENTE
+    # --------------------------------------------------------
+    st.divider()
+    st.header("2. Costruzione del profilo musicale")
+
+    st.subheader("2.1 Quanto tempo ascolti musica mediamente durante una giornata?")
     frequenza_ascolto_musica = st.radio(
         "Seleziona una risposta:",
         [
@@ -1198,32 +1308,79 @@ if (
             "Da 30 minuti a meno di 1 ora",
             "Da 1 ora a meno di 2 ore",
             "Da 2 ore a meno di 3 ore",
-            "3 ore o più",
+            "Più di 3 ore",
         ],
         index=None,
         key="final_frequenza_ascolto_musica",
     )
 
-    st.subheader("7. Se c'è qualcosa che vuoi dire, faccelo sapere (facoltativo).")
-    commento = st.text_area(
-        "Commento facoltativo",
-        placeholder="Scrivi qui eventuali osservazioni, commenti o suggerimenti...",
-        key="final_commento",
+    st.subheader("2.2 Quando ascolti musica, come scegli generalmente cosa ascoltare?")
+    scelta_algoritmo = st.radio(
+        "1 = Scelgo personalmente; 5 = Lascio scegliere il sistema",
+        [
+            "1 — Scelgo personalmente",
+            "2 — Principalmente scelgo io, ma a volte lascio scegliere il sistema",
+            "3 — Scelgo io e lascio scegliere al sistema in egual misura",
+            "4 — Un po' scelgo io, ma principalmente lascio scegliere il sistema",
+            "5 — Lascio che sia il sistema a scegliere per me",
+        ],
+        index=None,
+        key="final_scelta_algoritmo",
+    )
+    scelta_algoritmo = int(scelta_algoritmo[0]) if scelta_algoritmo else None
+
+    st.subheader("2.3 Quando ascolti musica, preferisci riascoltare brani che conosci oppure scoprire musica nuova?")
+    scoperta_musica_label = st.radio(
+        "1 = Quasi solo brani che conosco; 5 = Quasi solo brani che non conosco",
+        [
+            "1 — Quasi solo brani che conosco",
+            "2 — Prevalentemente brani che conosco",
+            "3 — Entrambe le cose in egual misura",
+            "4 — Prevalentemente musica nuova",
+            "5 — Quasi solo brani che non conosco",
+        ],
+        index=None,
+        key="final_scoperta_musica",
+    )
+    scoperta_musica = int(scoperta_musica_label[0]) if scoperta_musica_label else None
+
+    st.subheader("2.4 Quanto spesso scegli musica o playlist in base al tuo stato d'animo?")
+    playlist_mood = st.radio(
+        "Seleziona una risposta:",
+        ["Mai", "Raramente", "Qualche volta", "Spesso", "Sempre"],
+        index=None,
+        key="final_playlist_mood",
     )
 
+    st.subheader("2.5 Quando scegli musica in base al tuo stato d'animo, cosa preferisci generalmente?")
+    preferenza_musica_per_mood = st.radio(
+        "Seleziona una risposta:",
+        [
+            "Musica che rispecchia il mio stato d'animo",
+            "Musica che mi aiuta a cambiare il mio stato d'animo",
+            "Dipende dalla situazione",
+            "Non scelgo musica in base al mio stato d'animo",
+        ],
+        index=None,
+        key="final_preferenza_musica_per_mood",
+    )
+
+    # --------------------------------------------------------
+    # SEZIONE 3: DATI SOCIO-DEMOGRAFICI
+    # --------------------------------------------------------
     st.divider()
-    st.header("👤 Domande socio-demografiche")
+    st.header("3. Dati socio-demografici")
 
     genere_demografico = st.radio(
-        "Indica il tuo genere:",
+        "3.1 Indica il tuo genere:",
         ["Maschio", "Femmina", "Altro"],
         index=None,
         key="final_genere_demografico",
     )
 
-    age_options = ["Meno di 14 anni"] + [str(age) for age in range(14, 81)] + ["80 anni o più"]
+    age_options = [str(age) for age in range(18, 80)] + ["80+"]
     eta = st.selectbox(
-        "Indica la tua età:",
+        "3.2 Indica la tua età:",
         age_options,
         index=None,
         placeholder="Seleziona l'età",
@@ -1237,7 +1394,7 @@ if (
         "Trentino-Alto Adige", "Umbria", "Valle d'Aosta", "Veneto", "Vivo all'estero",
     ]
     regione_residenza = st.selectbox(
-        "Indica la tua regione di residenza:",
+        "3.3 Indica la tua regione di residenza:",
         region_options,
         index=None,
         placeholder="Seleziona una regione",
@@ -1245,12 +1402,12 @@ if (
     )
 
     istruzione = st.selectbox(
-        "Indica il tuo titolo di studio:",
+        "3.4 Indica il tuo titolo di studio:",
         [
             "Terza media",
-            "Diploma scuola superiore",
+            "Diploma superiore",
             "Laurea triennale",
-            "Laurea magistrale a ciclo unico",
+            "Laurea magistrale",
             "Dottorato di ricerca",
         ],
         index=None,
@@ -1260,8 +1417,8 @@ if (
 
     st.divider()
     st.write(
-        "Quando hai completato tutte le domande obbligatorie, clicca sul pulsante "
-        "qui sotto per inviare le tue risposte. Il commento è facoltativo."
+        "Controlla le risposte e poi invia il questionario. "
+        "Il commento sulla playlist è facoltativo."
     )
     invia_questionario = st.button(
         "Invia il questionario e termina 🎵",
@@ -1273,20 +1430,27 @@ if (
     if invia_questionario:
         required_answers = {
             "gradimento della playlist": gradimento_playlist,
-            "coerenza della playlist": coerenza_emotiva,
+            "coerenza emotiva": coerenza_emotiva,
+            "coerenza con i gusti musicali": gusti_musicali,
             "canzone preferita": canzone_preferita,
             "canzone meno preferita": canzone_meno_preferita,
             "numero di canzoni già conosciute": canzoni_gia_conosciute,
-            "frequenza di ascolto della musica": frequenza_ascolto_musica,
+            "tempo medio di ascolto": frequenza_ascolto_musica,
+            "modalità di scelta della musica": scelta_algoritmo,
+            "preferenza tra musica conosciuta e nuova": scoperta_musica,
+            "frequenza di scelta in base all'umore": playlist_mood,
+            "preferenza musicale in base all'umore": preferenza_musica_per_mood,
             "genere": genere_demografico,
             "età": eta,
             "regione di residenza": regione_residenza,
             "titolo di studio": istruzione,
         }
-        missing_answers = [label for label, value in required_answers.items() if value is None]
+        missing_answers = [
+            label for label, value in required_answers.items() if value is None
+        ]
 
         if missing_answers:
-            st.error("Rispondi a tutte le domande prima di inviare le tue risposte.")
+            st.error("Rispondi a tutte le domande obbligatorie prima di inviare il questionario.")
         else:
             try:
                 with st.spinner("Salvataggio delle risposte in corso..."):
@@ -1301,6 +1465,17 @@ if (
                         for index in range(7)
                     }
 
+                    # "si" solo se tutti i filtri iniziali sono stati rispettati.
+                    requisiti_soddisfatti = (
+                        "no" if st.session_state.playlist_fallback_used else "si"
+                    )
+
+                    # La modalità viene registrata solo quando la domanda è stata proposta.
+                    if final_emotion in EMOTIONS_WITH_MODE_QUESTION:
+                        coerenza_playlist = mode
+                    else:
+                        coerenza_playlist = pd.NA
+
                     new_row = {
                         "id_partecipante": participant_id,
                         "timestamp": timestamp,
@@ -1310,20 +1485,25 @@ if (
                         "anno_fine": preferences["end_year"],
                         "preferenza_popolarita": preferences["popularity_preference"],
                         "emozione_dichiarata": st.session_state.emozione_dichiarata_iniziale,
-                        # Nel CSV manteniamo i codici interni inglesi, più facili da analizzare.
                         "emozione_stimata": final_emotion,
-                        # La vecchia mappatura a quattro mood non è più usata nella playlist.
                         "mood": pd.NA,
-                        "modalita_playlist": mode,
-                        "emozione_destinazione": destination if destination else pd.NA,
+                        "requisiti_soddisfatti": requisiti_soddisfatti,
+                        "coerenza_playlist": coerenza_playlist,
                         "numero_canzoni": len(playlist_df),
                         "gradimento_playlist": gradimento_playlist,
                         "coerenza_emotiva": coerenza_emotiva,
+                        "gusti_musicali": gusti_musicali,
                         "canzone_preferita": canzone_preferita,
                         "canzone_meno_preferita": canzone_meno_preferita,
                         "canzoni_gia_conosciute": canzoni_gia_conosciute,
+                        "commento_valutazione": (
+                            commento_valutazione.strip() if commento_valutazione.strip() else pd.NA
+                        ),
                         "frequenza_ascolto_musica": frequenza_ascolto_musica,
-                        "commento": commento.strip() if commento else pd.NA,
+                        "scoperta_musica": scoperta_musica,
+                        "playlist_mood": playlist_mood,
+                        "scelta_algoritmo": scelta_algoritmo,
+                        "preferenza_musica_per_mood": preferenza_musica_per_mood,
                         "genere": genere_demografico,
                         "eta": eta,
                         "regione_residenza": regione_residenza,
